@@ -83,7 +83,7 @@ final class PrivilegedCoreService: @unchecked Sendable {
         self.timeout = timeout
     }
 
-    struct Snapshot {
+    struct Snapshot: Sendable {
         let running: Bool
         let pid: Int
         let lastExitCode: Int
@@ -166,41 +166,37 @@ final class PrivilegedCoreService: @unchecked Sendable {
 
     // MARK: - Plumbing
 
-    private func invoke<Value>(
+    private func invoke<Value: Sendable>(
         _ body: @escaping (ProxyHelperProtocol, @escaping (Result<Value, Error>) -> Void) -> Void)
         async throws -> Value
     {
         try await withCheckedThrowingContinuation { continuation in
-            let resumed = ResumeGuard()
             let connection = self.makeConnection()
+            let box = ContinuationBox<Value>(continuation)
 
             let timeoutItem = DispatchWorkItem {
-                guard resumed.claim() else { return }
                 connection.invalidate()
-                continuation.resume(throwing: PrivilegedCoreServiceError.timedOut)
+                box.resume(with: .failure(PrivilegedCoreServiceError.timedOut))
             }
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + self.timeout, execute: timeoutItem)
 
             guard let helper = connection.remoteObjectProxyWithErrorHandler({ error in
                 timeoutItem.cancel()
-                guard resumed.claim() else { return }
                 connection.invalidate()
-                continuation.resume(
-                    throwing: PrivilegedCoreServiceError.connectionFailed(error.localizedDescription))
+                box.resume(
+                    with: .failure(PrivilegedCoreServiceError.connectionFailed(error.localizedDescription)))
             }) as? ProxyHelperProtocol else {
                 timeoutItem.cancel()
-                guard resumed.claim() else { return }
                 connection.invalidate()
-                continuation.resume(
-                    throwing: PrivilegedCoreServiceError.connectionFailed("Unable to create XPC proxy."))
+                box.resume(
+                    with: .failure(PrivilegedCoreServiceError.connectionFailed("Unable to create XPC proxy.")))
                 return
             }
 
             body(helper) { result in
                 timeoutItem.cancel()
-                guard resumed.claim() else { return }
                 connection.invalidate()
-                continuation.resume(with: result)
+                box.resume(with: result)
             }
         }
     }
@@ -242,19 +238,6 @@ final class PrivilegedCoreService: @unchecked Sendable {
             let dict = info as? [String: Any]
         else { return nil }
         return dict[kSecCodeInfoTeamIdentifier as String] as? String
-    }
-}
-
-private final class ResumeGuard: @unchecked Sendable {
-    private let lock = NSLock()
-    private var used = false
-
-    func claim() -> Bool {
-        self.lock.withLock {
-            guard !self.used else { return false }
-            self.used = true
-            return true
-        }
     }
 }
 

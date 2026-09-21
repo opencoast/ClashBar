@@ -46,32 +46,6 @@ enum SystemProxyServiceError: LocalizedError {
     }
 }
 
-private final class ContinuationBox<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Value, Error>?
-
-    init(_ continuation: CheckedContinuation<Value, Error>) {
-        self.continuation = continuation
-    }
-
-    func resume(with result: Result<Value, Error>) {
-        self.lock.lock()
-        guard let continuation else {
-            self.lock.unlock()
-            return
-        }
-        self.continuation = nil
-        self.lock.unlock()
-
-        switch result {
-        case let .success(value):
-            continuation.resume(returning: value)
-        case let .failure(error):
-            continuation.resume(throwing: error)
-        }
-    }
-}
-
 struct SystemProxyService {
     private let helperResponseTimeoutNanoseconds: UInt64 = 4_000_000_000
     private let helperLaunchRetryDelayNanoseconds: UInt64 = 250_000_000
