@@ -1,0 +1,223 @@
+name: CI Build
+
+# Purpose: harvest compiler diagnostics in a form that is easy to copy out of
+# the run summary. Deliberately does NOT cache .build -- an incremental build
+# skips re-diagnosing unchanged files, which is exactly what we do not want
+# while iterating on compile errors.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_package:
+        description: 'Also run `make build` (packaging + ad-hoc codesign)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ci-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: swift build (${{ matrix.configuration }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [debug, release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode and report the toolchain
+        run: |
+          echo "### Available Xcode versions"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none found)"
+
+          # Pick the highest-versioned Xcode present on the runner.
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+          fi
+
+          echo "### Selected"
+          xcode-select -p
+          xcodebuild -version || true
+          swift --version
+
+      - name: Gate on Swift >= 6.2
+        run: |
+          # Package.swift declares `swift-tools-version: 6.2`. An older toolchain
+          # fails at package-load time with a message that tells us nothing about
+          # our own code, so fail early and loudly instead.
+          VER="$(swift --version 2>&1 | sed -n 's/.*Swift version \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+          echo "Detected Swift $VER"
+          MAJOR="${VER%%.*}"; MINOR="${VER##*.}"
+          if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 2 ]; }; then
+            {
+              echo "## Toolchain too old"
+              echo ""
+              echo "Package.swift needs Swift 6.2; runner has **$VER**."
+              echo ""
+              echo "Available Xcodes on this runner:"
+              echo '```'
+              ls -d /Applications/Xcode*.app 2>/dev/null || true
+              echo '```'
+              echo "Fix: pin a newer runner image, or add maxim-lobanov/setup-xcode."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: swift build
+        id: build
+        run: |
+          set +e
+          swift build -c ${{ matrix.configuration }} 2>&1 | tee build.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          CFG="${{ matrix.configuration }}"
+
+          # Header lines from swiftc are `path:line:col: error|warning: message`,
+          # in both the `swift` and `llvm` diagnostic styles.
+          grep -E '^[^ ]+\.swift:[0-9]+:[0-9]+: (error|warning):' build.log \
+            | sed "s|$PWD/||" | sort -u > diags.txt || true
+
+          grep ': error:'   diags.txt | sort -u > errors.txt   || true
+          grep ': warning:' diags.txt | sort -u > warnings.txt || true
+
+          # Linker / driver / package-resolution failures never match the pattern
+          # above, so surface them separately or we would report "0 errors" on a
+          # red build.
+          grep -E 'error:|fatal error:|ld: |Undefined symbols|linker command failed|Compiling for macOS' build.log \
+            | grep -vE '^[^ ]+\.swift:[0-9]+:[0-9]+:' | sort -u | head -40 > other.txt || true
+
+          NE=$(wc -l < errors.txt | tr -d ' ')
+          NW=$(wc -l < warnings.txt | tr -d ' ')
+
+          {
+            echo "## \`$CFG\` — $NE errors, $NW warnings"
+            echo ""
+            echo "swift build exit code: \`${{ steps.build.outputs.exit_code }}\`"
+            echo ""
+            if [ "$NE" -gt 0 ]; then
+              echo "<details open><summary>Errors (paste this back)</summary>"
+              echo ""
+              echo '```'
+              head -120 errors.txt
+              echo '```'
+              echo "</details>"
+              echo ""
+            fi
+            if [ -s other.txt ]; then
+              echo "<details><summary>Non-source diagnostics (linker / driver / package)</summary>"
+              echo ""
+              echo '```'
+              cat other.txt
+              echo '```'
+              echo "</details>"
+              echo ""
+            fi
+            if [ "$NW" -gt 0 ]; then
+              echo "<details><summary>Warnings ($NW)</summary>"
+              echo ""
+              echo '```'
+              head -80 warnings.txt
+              echo '```'
+              echo "</details>"
+              echo ""
+            fi
+
+            # Triage shortcut for the three failure modes flagged as most likely
+            # before any of this was ever compiled.
+            echo "### Known-risk hits"
+            echo ""
+            echo '```'
+            grep -iE 'proc_pidpath|libproc' diags.txt || echo "proc_pidpath/libproc: clean"
+            grep -iE 'sendable|data race|actor-isolated|main actor' diags.txt || echo "concurrency: clean"
+            grep -iE 'MihomoLogObserving|MihomoControlling|does not conform' diags.txt || echo "conformance: clean"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs-${{ matrix.configuration }}
+          path: |
+            build.log
+            diags.txt
+            errors.txt
+            warnings.txt
+            other.txt
+          if-no-files-found: warn
+
+      - name: Fail if the build failed
+        if: always() && steps.build.outputs.exit_code != '0'
+        run: |
+          echo "swift build failed; see the job summary for the copyable error list."
+          exit 1
+
+  package:
+    name: make build
+    needs: compile
+    if: github.event_name != 'workflow_dispatch' || inputs.run_package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer"
+          swift --version
+
+      - name: make build
+        run: |
+          set +e
+          make build 2>&1 | tee package.log
+          CODE=${PIPESTATUS[0]}
+          echo "make build exit: $CODE"
+          exit "$CODE"
+
+      - name: Inspect the bundle
+        if: success()
+        run: |
+          APP=dist/ClashBar.app
+          {
+            echo "## Bundle layout"
+            echo '```'
+            # The privileged helper must be in both places or SMAppService.daemon
+            # registration fails at runtime.
+            ls -l "$APP/Contents/Library/HelperTools/" || echo "MISSING HelperTools"
+            ls -l "$APP/Contents/Library/LaunchDaemons/" || echo "MISSING LaunchDaemons"
+            echo '```'
+            echo "### codesign"
+            echo '```'
+            codesign -dv --verbose=2 "$APP" 2>&1 | head -20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: package-log
+          path: package.log
+          if-no-files-found: warn
+
+  lint:
+    name: format + lint (non-blocking)
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install swiftformat swiftlint
+      - name: swiftformat --lint
+        run: swiftformat . --config .swiftformat --lint 2>&1 | tail -60 || true
+      - name: swiftlint
+        run: swiftlint lint --config .swiftlint.yml --quiet 2>&1 | tail -60 || true

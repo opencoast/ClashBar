@@ -25,6 +25,24 @@ extension AppViewModel {
                 try await self.ensureTunPermissions(requestIfMissing: true)
             }
 
+            // Behaviour change from the setuid design: TUN is no longer a pure
+            // runtime PATCH. Creating a utun device needs a root core, and the
+            // root core is a different process than the unprivileged one, so
+            // crossing that line requires a restart.
+            if !self.isRemoteTarget, self.privilegedBackendRequired != enabled {
+                self.syncPrivilegedBackendSelection(tunEnabled: enabled)
+                if self.isRuntimeRunning {
+                    appendLog(level: "info", message: tr("log.tun.backend_switch_restart"))
+                    await self.restartCore(trigger: .restart, privilegedBackend: enabled)
+                    guard self.isRuntimeRunning else {
+                        isTunEnabled = false
+                        persistEditableSettingsSnapshot()
+                        appendLog(level: "error", message: tr("log.tun.backend_switch_failed"))
+                        return
+                    }
+                }
+            }
+
             guard self.isRemoteTarget || self.isRuntimeRunning else { return }
             try await self.patchTunConfig(enable: enabled)
 
@@ -53,10 +71,12 @@ extension AppViewModel {
 
         do {
             try await self.ensureTunPermissions(requestIfMissing: true)
+            self.syncPrivilegedBackendSelection(tunEnabled: true)
             return overlay
         } catch {
             isTunEnabled = false
             persistEditableSettingsSnapshot()
+            self.syncPrivilegedBackendSelection(tunEnabled: false)
             appendLog(level: "warning", message: tr("log.tun.startup_disabled"))
             return overlay.withTunEnabled(false)
         }
@@ -89,6 +109,12 @@ extension AppViewModel {
                 return tr("app.tun.error.authorization_failed", message)
             case .permissionVerificationFailed:
                 return tr("app.tun.error.permission_verify_failed")
+            case .privilegedCoreStale:
+                return tr("app.tun.error.privileged_core_stale")
+            case let .privilegedCoreNotTrusted(reason):
+                return tr("app.tun.error.privileged_core_untrusted", reason)
+            case let .hashingFailed(message):
+                return tr("app.tun.error.hashing_failed", message)
             }
         }
 
@@ -129,14 +155,46 @@ extension AppViewModel {
 
         do {
             try self.tunPermissionRepository.validateCurrentPermissions(binaryPath: binaryPath)
-        } catch TunPermissionServiceError.permissionMissing {
-            guard requestIfMissing else {
-                throw TunPermissionServiceError.permissionMissing
+        } catch let error as TunPermissionServiceError {
+            // `permissionMissing` means no privileged core yet; `stale` means the
+            // managed core was updated and the root copy no longer matches its
+            // bytes. Both are fixed by the same one-prompt install.
+            let installable: Bool
+            switch error {
+            case .permissionMissing, .privilegedCoreStale:
+                installable = true
+            default:
+                installable = false
             }
+            guard installable else { throw error }
+            guard requestIfMissing else { throw error }
+
             appendLog(level: "info", message: tr("log.tun.permission_requesting"))
             try await self.tunPermissionRepository.grantPermissions(binaryPath: binaryPath)
             appendLog(level: "info", message: tr("log.tun.permission_granted"))
         }
+    }
+
+    /// True when the next core launch will go through the privileged helper.
+    var privilegedBackendRequired: Bool {
+        (self.processManager as? CoreBackendRouter)?.requiresPrivilegedBackend ?? false
+    }
+
+    /// Chooses the backend for the *next* start/restart. Does nothing to a core
+    /// that is already running -- crossing the privilege boundary always needs a
+    /// restart, which the callers above perform explicitly.
+    func syncPrivilegedBackendSelection(tunEnabled: Bool) {
+        guard let router = self.processManager as? CoreBackendRouter else { return }
+        router.requiresPrivilegedBackend = tunEnabled && !self.isRemoteTarget
+    }
+
+    /// Surfaces a setuid-root core left behind by ClashBar <= 0.x. Enabling TUN
+    /// once clears it, but a user who never turns TUN on again would otherwise
+    /// keep a root-executable binary in a directory they can write to.
+    func warnAboutLegacySetuidCoreIfNeeded() {
+        guard let binaryPath = resolvedMihomoBinaryPath() else { return }
+        guard self.tunPermissionRepository.legacySetuidPresent(binaryPath: binaryPath) else { return }
+        appendLog(level: "warning", message: tr("log.tun.legacy_setuid_detected", binaryPath))
     }
 
     func verifyTunAfterOverlayIfNeeded(overlay: EditableSettingsSnapshot) async {

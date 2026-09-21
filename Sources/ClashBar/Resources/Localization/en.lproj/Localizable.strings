@@ -266,7 +266,7 @@
 "app.system_proxy.alert.helper_invalid_signature" = "Helper signature mismatch";
 "app.system_proxy.alert.unknown" = "System proxy operation failed";
 "app.tun.error.binary_not_found" = "No mihomo core was found. Copy an executable named \"mihomo\" to %@ first.";
-"app.tun.error.permission_missing" = "TUN mode requires root + setuid permissions on mihomo binary.";
+"app.tun.error.permission_missing" = "TUN mode requires a root-owned copy of the mihomo core to be installed.";
 "app.tun.error.authorization_cancelled" = "Administrator authorization was cancelled.";
 "app.tun.error.authorization_failed" = "Failed to grant TUN permissions: %@";
 "app.tun.error.permission_verify_failed" = "TUN permissions were not applied successfully.";
@@ -416,3 +416,11 @@
 "app.config.delete.message" = "This will permanently delete the config file. If it is a remote subscription, the subscription metadata will also be removed.";
 "log.config.delete.success" = "Config deleted: %@";
 "log.config.delete.failed" = "Failed to delete config (%@): %@";
+
+/* --- privileged core (TUN) --- */
+"app.tun.error.privileged_core_stale" = "The installed privileged core does not match the managed mihomo core. Reinstall it.";
+"app.tun.error.privileged_core_untrusted" = "The installed privileged core failed its security check: %@";
+"app.tun.error.hashing_failed" = "Failed to hash the mihomo core: %@";
+"log.tun.backend_switch_restart" = "Toggling TUN moves the core between the privileged and unprivileged backends. Restarting...";
+"log.tun.backend_switch_failed" = "The core did not come back after switching backends. TUN was disabled.";
+"log.tun.legacy_setuid_detected" = "Found a setuid-root core left by an older version: %@. Enabling TUN once removes it.";

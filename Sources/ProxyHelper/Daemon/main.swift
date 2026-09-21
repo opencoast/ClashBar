@@ -413,6 +413,16 @@ private final class SystemProxyConfigurator {
 
 private final class ProxyHelperService: NSObject, ProxyHelperProtocol {
     private let configurator = SystemProxyConfigurator()
+    private let coreRunner: PrivilegedCoreRunner
+    /// Audited euid of the XPC peer. The privileged core methods resolve the
+    /// caller's config directory from this, never from a client-supplied path.
+    private let clientUID: uid_t
+
+    init(clientUID: uid_t, coreRunner: PrivilegedCoreRunner = .shared) {
+        self.clientUID = clientUID
+        self.coreRunner = coreRunner
+        super.init()
+    }
 
     func ping(completion: @escaping (Bool, String?) -> Void) {
         completion(true, nil)
@@ -501,14 +511,60 @@ private final class ProxyHelperService: NSObject, ProxyHelperProtocol {
             completion(false, error.localizedDescription)
         }
     }
+
+    // MARK: - Privileged core lifecycle
+
+    func startCore(
+        configFileName: String,
+        controllerHost: String,
+        controllerPort: Int,
+        completion: @escaping (Bool, Int, String?) -> Void)
+    {
+        do {
+            let pid = try self.coreRunner.start(
+                configFileName: configFileName,
+                controllerHost: controllerHost,
+                controllerPort: controllerPort,
+                clientUID: self.clientUID)
+            completion(true, pid, nil)
+        } catch {
+            completion(false, 0, error.localizedDescription)
+        }
+    }
+
+    func stopCore(completion: @escaping (Bool, String?) -> Void) {
+        do {
+            try self.coreRunner.stop()
+            completion(true, nil)
+        } catch {
+            completion(false, error.localizedDescription)
+        }
+    }
+
+    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?) -> Void) {
+        let snapshot = self.coreRunner.status()
+        completion(true, snapshot.running, snapshot.pid, snapshot.lastExitCode, nil)
+    }
+
+    func privilegedCoreInfo(completion: @escaping (Bool, Bool, String?, String?) -> Void) {
+        guard let digest = self.coreRunner.installedCoreSHA256() else {
+            completion(true, false, nil, nil)
+            return
+        }
+        completion(true, true, digest, nil)
+    }
 }
 
 private final class ProxyHelperListenerDelegate: NSObject, NSXPCListenerDelegate {
-    private let service = ProxyHelperService()
-
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        // One service instance per connection: the privileged core methods need
+        // the peer's audited euid, and `effectiveUserIdentifier` is a property of
+        // the connection rather than of the listener.
+        let uid = newConnection.effectiveUserIdentifier
+        guard uid != 0, uid >= 500 else { return false }
+
         newConnection.exportedInterface = NSXPCInterface(with: ProxyHelperProtocol.self)
-        newConnection.exportedObject = self.service
+        newConnection.exportedObject = ProxyHelperService(clientUID: uid, coreRunner: .shared)
         newConnection.resume()
         return true
     }

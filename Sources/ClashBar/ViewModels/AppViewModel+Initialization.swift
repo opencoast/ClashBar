@@ -4,7 +4,9 @@ import Foundation
 extension AppViewModel {
     func configureManagedProcessCallbacks() {
         self.mihomoBinaryPath = self.coreRepository.detectedBinaryPath ?? "-"
-        if let managedProcess = self.processManager as? MihomoProcessManager {
+        // Either backend (child process or helper-spawned) emits through
+        // `MihomoLogObserving`, so no concrete downcast here any more.
+        if let managedProcess = self.processManager as? (any MihomoLogObserving) {
             managedProcess.onLog = { [weak self] line in
                 Task { @MainActor in
                     guard self?.isRemoteTarget != true else { return }

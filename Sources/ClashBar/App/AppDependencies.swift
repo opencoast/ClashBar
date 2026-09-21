@@ -18,7 +18,15 @@ struct AppDependencies {
 
     static var live: AppDependencies {
         let workingDirectoryManager = WorkingDirectoryManager()
-        let processManager = MihomoProcessManager(workingDirectoryManager: workingDirectoryManager)
+        // The child-process backend stays exactly as it was; it is still what
+        // runs for system-proxy-only users, so they never get a root process.
+        let childProcessManager = MihomoProcessManager(workingDirectoryManager: workingDirectoryManager)
+        // The privileged backend asks the root helper to spawn the core. It
+        // reuses the child manager for `mihomo -t`, which needs no privilege.
+        let privilegedController = PrivilegedCoreController(validator: childProcessManager)
+        let processManager = CoreBackendRouter(
+            unprivileged: childProcessManager,
+            privileged: privilegedController)
         let configManager = ConfigDirectoryManager(workingDirectoryManager: workingDirectoryManager)
         let configRepository = DefaultConfigRepository(
             configManager: configManager,

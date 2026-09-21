@@ -111,7 +111,11 @@ extension AppViewModel {
         resetTrafficPresentation()
     }
 
-    func restartCore(trigger: ProviderRefreshTrigger = .restart) async {
+    /// - Parameter privilegedBackend: explicit backend intent for this restart.
+    ///   `nil` keeps whatever `isTunEnabled` currently says. `toggleTunMode` must
+    ///   pass it explicitly, because it restarts *before* committing
+    ///   `isTunEnabled`, so reading that flag here would undo the switch.
+    func restartCore(trigger: ProviderRefreshTrigger = .restart, privilegedBackend: Bool? = nil) async {
         guard !self.isRemoteTarget else { return }
         guard !isCoreActionProcessing else { return }
         coreActionState = .restarting
@@ -136,6 +140,9 @@ extension AppViewModel {
                 transitionKind: .restart,
                 disableRuntimeTunBeforeStop: false)
             let settingsOverlay = self.overlayApplyingPendingCoreFeatureRecovery(currentEditableSettingsSnapshot())
+            // TUN needs the privileged backend; everything else keeps the
+            // unprivileged child process.
+            self.syncPrivilegedBackendSelection(tunEnabled: privilegedBackend ?? self.isTunEnabled)
             _ = try await self.coreRepository.restart(configPath: configPath, controller: launchController)
             await self.completeCoreBootstrap(
                 configPath: configPath,

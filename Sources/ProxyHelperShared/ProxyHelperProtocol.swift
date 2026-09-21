@@ -6,6 +6,40 @@ public enum ProxyHelperConstants {
     public static let helperBundleProgram = "Contents/Library/HelperTools/com.clashbar.helper"
     public static let allowedClientBundleIdentifier = "com.clashbar"
     public static let allowedClientRequirement = "identifier \"\(allowedClientBundleIdentifier)\""
+
+    /// Code-signing identifier of the helper itself. `codesign` derives this from
+    /// the binary's filename when `-i` is not passed, which is what
+    /// `Scripts/package_app.sh` does.
+    public static let helperBundleIdentifier = "com.clashbar.helper"
+    public static let allowedHelperRequirement = "identifier \"\(helperBundleIdentifier)\""
+
+    // MARK: - Privileged core layout
+    //
+    // Everything below deliberately lives outside the user's home directory.
+    // The helper runs as root, and a root process must never execute a binary --
+    // or read a configuration -- out of a directory the logged-in user can
+    // write to. `/Library/Application Support` is root-owned, so a local
+    // attacker running as the console user cannot swap the core out from under
+    // the helper, nor hand it a configuration of their choosing.
+
+    public static let privilegedRootPath = "/Library/Application Support/ClashBar"
+    public static let privilegedCoreDirectoryPath = privilegedRootPath + "/core"
+    public static let privilegedCoreBinaryPath = privilegedCoreDirectoryPath + "/mihomo"
+    public static let privilegedRunDirectoryPath = privilegedRootPath + "/run"
+    public static let privilegedRuntimeConfigPath = privilegedRunDirectoryPath + "/config.yaml"
+    public static let privilegedPidFilePath = privilegedRunDirectoryPath + "/core.pid"
+    public static let privilegedLogDirectoryPath = privilegedRootPath + "/logs"
+    public static let privilegedCoreLogPath = privilegedLogDirectoryPath + "/core.log"
+
+    /// Resolved by the helper against the home directory of the *audited* euid of
+    /// the XPC connection -- never against a path supplied by the client.
+    public static let userConfigDirectoryRelativePath = "Library/Application Support/clashbar/config"
+
+    public static let maximumCoreLogBytes = 4 * 1024 * 1024
+    public static let maximumConfigBytes = 5 * 1024 * 1024
+
+    /// Sentinel for "this core has not exited during the helper's lifetime".
+    public static let unknownExitCode = -1
 }
 
 @objc(ProxyHelperProtocol)
@@ -28,4 +62,39 @@ public protocol ProxyHelperProtocol {
         completion: @escaping (Bool, Bool, String?) -> Void)
     func getSystemProxyExceptions(completion: @escaping (Bool, String?, String?) -> Void)
     func setSystemProxyExceptions(serializedExceptions: String, completion: @escaping (Bool, String?) -> Void)
+
+    // MARK: - Privileged core lifecycle
+    //
+    // Deliberately *not* a general-purpose process launcher. The caller cannot
+    // choose the executable, the working directory, the data directory, or any
+    // argument other than a bare config filename and a loopback controller
+    // endpoint. Everything else is fixed in the helper.
+
+    /// Starts the privileged core.
+    ///
+    /// - Parameters:
+    ///   - configFileName: A bare filename (no path separators) ending in
+    ///     `.yaml`/`.yml`, resolved inside the calling user's own config
+    ///     directory. Anything else is rejected.
+    ///   - controllerHost: Must be a loopback literal (`127.0.0.1` or `::1`).
+    ///   - controllerPort: 1...65535.
+    ///   - completion: `(ok, pid, message)`. `pid` is 0 on failure.
+    func startCore(
+        configFileName: String,
+        controllerHost: String,
+        controllerPort: Int,
+        completion: @escaping (Bool, Int, String?) -> Void)
+
+    /// Stops the privileged core. Succeeds when nothing is running.
+    func stopCore(completion: @escaping (Bool, String?) -> Void)
+
+    /// `(ok, running, pid, lastExitCode, message)`. `pid` is 0 when not running;
+    /// `lastExitCode` is `ProxyHelperConstants.unknownExitCode` when the core has
+    /// not exited yet.
+    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?) -> Void)
+
+    /// Reports whether a usable privileged core is installed, and the SHA-256 of
+    /// its bytes so the app can tell a stale copy from a current one.
+    /// `(ok, installed, sha256Hex, message)`.
+    func privilegedCoreInfo(completion: @escaping (Bool, Bool, String?, String?) -> Void)
 }
