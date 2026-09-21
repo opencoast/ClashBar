@@ -1,3 +1,54 @@
+## v0.4.0-dev (privileged-helper-core)
+
+![macOS](https://img.shields.io/badge/macOS-Supported-000000?style=flat-square&logo=apple) ![Core](https://img.shields.io/badge/Core-Mihomo-6366f1?style=flat-square) ![Status](https://img.shields.io/badge/Status-Not%20for%20release-EF4444?style=flat-square)
+
+> 本次改动集中在 **TUN 模式的特权模型重构**：删除「给 mihomo 内核打 setuid-root」的做法，改为内核以 root 身份由特权 helper 拉起，且内核二进制与运行时配置都移到用户不可写的 root 目录下。配套收紧了 root 内核的控制面（强制 loopback + helper 生成并注入控制器密钥 + 剥离订阅可注入的危险顶层键）、把读取用户配置改为逐级 `openat` 校验，并新增可单测的启动校验层与 Tests target。
+>
+> ⚠️ **此版本尚未适合发布**：特权内核的安装目前需要用户手动执行一条 `sudo install` 命令，且仍有若干 P1 正确性问题与行为回归未处理（详见 `REVIEW-BLOCKING-ISSUES.md`）。
+
+### 📝 更新日志 (Changelog)
+
+**🔒 安全修复 (Security)**
+
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **移除 setuid-root 内核，消除本地提权面**：此前启用 TUN 会对 `~/Library/Application Support/clashbar/core/mihomo` 执行 `chown root:admin && chmod u+s`。该二进制位于**用户可写目录**、读取**用户可写的 `config.yaml`**，任何以该用户身份运行的本地进程都能用自选配置调用这个 setuid-root 内核（mihomo 配置可经 `proxy-providers` 的 `path:` 写文件、绑定监听、开放控制器），构成现实可行的本地提权路径。且 setuid 位是永久的——**只要开启过一次 TUN，之后即使切回纯系统代理模式内核也一直以 root 运行**。现改为内核二进制安装到 `root:wheel 0755` 的 `/Library/Application Support/ClashBar/core/mihomo`，由已存在的 root LaunchDaemon（`com.clashbar.helper`）以固定参数向量拉起。同时会将遗留的 setuid 位与 root 属主状态检测出来并在日志中提示清理命令。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **root 内核的控制器不再无鉴权**：helper 每次启动内核时生成 32 字节随机密钥，注入到暂存配置中并经 XPC 回传给 App 作为 Bearer token。此前 root 内核的 REST API 对本机任意用户的任意进程开放，而 `POST /upgrade` 会让内核下载新二进制、覆写自己那个 root 属主的可执行文件并 re-exec —— 即 root 远程代码执行；`PUT /configs` 亦可让 root 内核加载攻击者指定的配置。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **暂存配置剥离危险顶层键**：用户配置不是 root 进程的可信输入。新增 `ConfigSanitizer`，在交给 root 内核前剥除两类顶层键——控制面（`external-controller*`、`secret`、`external-ui*`、`external-doh-server`、`tls`）与入站暴露（`allow-lan`、`bind-address`、`authentication`、`skip-auth-prefixes`、`lan-allowed-ips`、`lan-disallowed-ips`、`listeners`、`tunnels`）。远端订阅原本可投递 `allow-lan: true` 配合 `skip-auth-prefixes: ["0.0.0.0/0"]`，即以 root 身份开出一个无鉴权的开放中继。仅处理顶层键，节点自身同名字段（如某代理的 `secret`）不受影响。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **读取用户配置改为逐级 `openat` 校验**：用户家目录下每一级路径都由用户控制，只在末段使用 `O_NOFOLLOW` 时，把 `…/clashbar/config` 替换成符号链接即可让 root helper 读取任意文件。现改为 `Library` → `Application Support` → `clashbar` → `config` 逐级 `openat(O_DIRECTORY|O_NOFOLLOW)`，符号链接直接以 `ELOOP` 失败，每级 `fstat` 校验属主与非 world-writable；最终文件另外要求 `st_uid` 等于调用方 uid（该检查针对硬链接，符号链接检查对其无效）。配置目标目录从 XPC 调用方的**已审计 euid**（`effectiveUserIdentifier` → `getpwuid`）推导，不接受任何客户端传入的路径。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **root 内核日志不再全局可读**：日志目录与文件改为 `0750` / `0640 root:staff`。console 用户属于 `staff` 组，App 仍可读取；其他本地账户无法读取 root 内核记录的 DNS 查询与连接目标。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **App 侧不再执行任何 root 文件操作**：中途曾尝试用一次 `osascript ... with administrator privileges` 完成安装，但 `/Library/Application Support` 为 `root:admin 0775` 且 console 用户通常属于 `admin` 组——攻击者可预先把 `…/ClashBar/core` 建成符号链接，而 `chmod` 跟随符号链接、`install` 穿透符号链接写入，一次合法授权即可获得对攻击者指定路径的 root 属主 `0755` 写入。root 身份运行的 inline `sh -c` 无法抵御可循环重试的本地攻击者（`test -L` 只能缩小竞争窗口），因此该方案被整体废弃：`TunService` 现在只做 `lstat` 校验并给出待执行命令，`grep 'Process()'` 在该文件中返回零。
+- ![Security](https://img.shields.io/badge/Security-EF4444?style=flat-square) **客户端侧补充 XPC 签名校验**：`PrivilegedCoreService` 对外发的 `NSXPCConnection` 设置 `setCodeSigningRequirement`，此前仅 helper 单向校验客户端。注意 ad-hoc 签名下双方要求均退化为仅匹配 identifier —— **本设计依赖真实 Developer ID 签名**。
+
+**✨ 新增功能 (New Features)**
+
+- ![Feature](https://img.shields.io/badge/Feature-10B981?style=flat-square) **特权/非特权双内核后端**：新增 `CoreBackendRouter`，按 TUN 开关在「App 子进程」与「helper 拉起的 root 内核」之间选择。纯系统代理用户完全走原有非特权路径，**机器上不会出现任何 root 进程**。
+- ![Feature](https://img.shields.io/badge/Feature-10B981?style=flat-square) **helper 新增内核生命周期接口**：`startCore` / `stopCore` / `coreStatus` / `privilegedCoreInfo`。刻意**不是**通用进程启动器——可执行文件路径、工作目录、数据目录与参数结构均为 helper 内编译期常量，调用方只能提供一个裸配置文件名（白名单字符集、必须 `.yaml`/`.yml`、无路径分隔符）与一个 loopback 端口。
+- ![Feature](https://img.shields.io/badge/Feature-10B981?style=flat-square) **可单测的启动校验层与 Tests target**：`CoreLaunchValidation`、`PrivilegedControllerEndpoint`、`ConfigSanitizer` 移入 `ProxyHelperShared` 并做成纯函数，新增 `Tests/ProxyHelperSharedTests`（25 个测试，全为对抗性用例：路径穿越、嵌入 NUL、RTL override、命令替换、非 loopback 控制器、开放中继组合、CRLF/引号/大小写键名等）。**此举的动因是：没有 Developer ID 时特权路径无法端到端运行，而纯静态审查正是首版漏掉上述提权漏洞的原因。**
+- ![Feature](https://img.shields.io/badge/Feature-10B981?style=flat-square) **GitHub Actions 构建与测试工作流**：`swift build`（debug + release）+ `swift test` + `make build` 打包检查 + 非阻断的 swiftformat/swiftlint。诊断经去重、去路径前缀后写入 job summary；整包构建失败时自动回退为逐 target 编译，避免单个模块的 `emit-module` 失败掩盖其余模块的错误。刻意不缓存 `.build`——增量编译会跳过未变更文件的诊断。
+
+**🚀 优化改进 (Improvements)**
+
+- ![Optimize](https://img.shields.io/badge/Optimize-3B82F6?style=flat-square) **root 内核日志直写文件，helper 不做缓冲**：特权内核的 stdout/stderr 直接指向日志文件描述符（带 4 MiB 轮转），App 侧以 `PrivilegedCoreLogTail` 轮询读取。这在结构上消除了 v0.3.3 所修复的那类洪泛问题（TUN 句柄失效后约 16 万行/秒）——helper 完全不持有内核输出。
+- ![Optimize](https://img.shields.io/badge/Optimize-3B82F6?style=flat-square) **`ContinuationBox` 提升为共享类型**：从 `SystemProxyService` 中逐字移出到 `Core/Utils/ContinuationBox.swift`，helper 客户端复用而非重复实现。Swift 6 中 `CheckedContinuation.resume(with:)` 的参数带 `sending`，该类型在内部拆解 `Result` 并改调 `resume(returning:)` / `resume(throwing:)` 以规避 `#SendingRisksDataRace`。
+- ![Optimize](https://img.shields.io/badge/Optimize-3B82F6?style=flat-square) **`MihomoLogObserving` 抽象**：`AppViewModel` 不再向下转型到具体的 `MihomoProcessManager`，两个后端统一经该协议回调日志与终止事件。
+- ![Optimize](https://img.shields.io/badge/Optimize-3B82F6?style=flat-square) **helper 按连接创建服务实例**：`effectiveUserIdentifier` 是连接而非监听器的属性，因此改为每连接一个 `ProxyHelperService`，并在 `shouldAcceptNewConnection` 中拒绝 uid 0 与 uid < 500。
+
+**🐞 修复问题 (Bug Fixes)**
+
+- ![Fix](https://img.shields.io/badge/Fix-EF4444?style=flat-square) **`restartCore` 会撤销 TUN 的后端切换**：`toggleTunMode` 在提交 `isTunEnabled` **之前**就会重启内核，而 `restartCore` 内部又按 `isTunEnabled` 重新选择后端，导致标志被翻回，内核以普通用户重启、utun 创建失败——即「开启 TUN 完全不生效」。现改为显式传入 `privilegedBackend: Bool?`（带默认值，其余四个调用点不受影响）。
+- ![Fix](https://img.shields.io/badge/Fix-EF4444?style=flat-square) **裸 IPv6 字面量被按自身冒号切分**：`external-controller: ::1` 会被按最后一个冒号切成 host `":"`（随后收窄为 `127.0.0.1`）与 port `1`。IPv6 附带端口必须使用括号，因此无括号且含多个冒号的地址应整体视为主机名。此问题编译器无法发现，由新增的单元测试捕获。
+- ![Fix](https://img.shields.io/badge/Fix-EF4444?style=flat-square) **注入的控制器密钥被配置文件中的值覆盖**：`applyControllerSecretFromConfig` 会在配置同步时用（已被剥离的）配置值替换 helper 注入的密钥，导致后续所有 API 调用 401。现在特权内核运行期间该路径直接返回。
+- ![Fix](https://img.shields.io/badge/Fix-EF4444?style=flat-square) **`@main` 与顶层代码冲突**：名为 `main.swift` 的文件按顶层代码（脚本）模式编译，而含此类文件的模块不允许使用 `@main`。上游在该 target 仅有单文件时未触发；新增 `PrivilegedCoreRunner.swift` 后模块变为多文件，冲突显现。文件重命名为 `ProxyHelperMain.swift`（`Package.swift` 指向目录、打包脚本引用构建产物，均无需改动）。
+- ![Fix](https://img.shields.io/badge/Fix-EF4444?style=flat-square) **Swift 6 并发与弃用 API**：修复 `TunPermissionService` 因新增 `FileManager` 存储属性而失去隐式 `Sendable`、致使 `Task.detached` 无法编译的问题；为 `proc_pidpath` 补充 `import Darwin.libproc`（其声明位于 `<libproc.h>`，`import Darwin` 不保证重导出）；以 `proc_pidpath` 返回的字节长度精确解码，替换已弃用的 `String(cString:)`。
+
+**⚠️ 已知问题 (Known Issues)**
+
+- 特权内核的安装需用户手动执行 `sudo install`（App 已不做任何 root 文件操作）。安全的自动安装方案需在 helper 内以 `openat`/`mkdirat` 链实现，并由 Authorization Services 的自定义 right 把关。
+- 仍有 11 项 P1 正确性问题，其中 pidfile 竞争可能导致同时运行两个 root 内核、跨后端 `stop` 绕过 `lifecycleQueue`、状态轮询器提前退出后状态锁死为 Running、`invalidationHandler` 缺失导致 App 崩溃后 root 内核继续持有默认路由。
+- 7 项行为回归，其中用户可感知的两项：`-d` 指向 root 运行目录导致 GeoIP/GeoSite 重新下载、provider 与延迟缓存丢失、配置中的**相对** ruleset 路径失效；暂存配置为快照，导致 TUN 模式下「重载配置」与订阅自动更新实际重新应用旧配置。
+- TUN 开关现在需要重启内核（两个方向皆是），不再是纯运行时 `PATCH /configs`。
+- 上游遗留：`Scripts/package_app.sh` 的 `format_bytes` 使用 `index` 作为变量名，而 `index` 是 awk 内置函数，macOS 的 BWK awk 直接报错（体积数字显示为空）。改为 `i` 即可，与本次改动无关。
+
+
 ## v0.3.3
 
 ![macOS](https://img.shields.io/badge/macOS-Supported-000000?style=flat-square&logo=apple) ![Version](https://img.shields.io/badge/Release-v0.3.3-10B981?style=flat-square) ![Core](https://img.shields.io/badge/Core-Mihomo-6366f1?style=flat-square)
