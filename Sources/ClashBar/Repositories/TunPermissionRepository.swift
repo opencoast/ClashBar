@@ -4,11 +4,14 @@ import Foundation
 protocol TunPermissionRepository: AnyObject {
     func hasRequiredPermissions(binaryPath: String) -> Bool
     func validateCurrentPermissions(binaryPath: String) throws
-    func grantPermissions(binaryPath: String) async throws
+    /// Installs the privileged core through the helper, behind an administrator
+    /// prompt. Returns the SHA-256 of the installed bytes.
+    @discardableResult
+    func installPrivilegedCore(binaryPath: String) async throws -> String
     /// True when an older ClashBar left a setuid-root bit on the user-managed
     /// core. The app surfaces this so the user can clean it up.
     func legacySetuidPresent(binaryPath: String) -> Bool
-    /// The command the user runs to install the privileged core. The app never
+    /// Fallback instructions for when the helper is unreachable. The app never
     /// performs root file operations itself.
     func installCommand(binaryPath: String) -> String
     func legacyCleanupCommand(binaryPath: String) -> String

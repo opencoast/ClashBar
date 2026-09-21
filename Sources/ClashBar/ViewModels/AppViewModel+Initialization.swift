@@ -76,6 +76,12 @@ extension AppViewModel {
 
         self.startupRefreshTask = Task { [weak self] in
             guard let self else { return }
+            // Must run before the first API call. A privileged core started by a
+            // previous session survives an app restart (it belongs to launchd,
+            // not to us), and its controller demands the secret the helper
+            // injected. Without adopting that secret first, every request comes
+            // back 401 and the UI shows a core it cannot talk to.
+            await self.reconcileWithPrivilegedHelperAtLaunch()
             await self.refreshFromAPI(includeSlowCalls: true)
             await self.applyPendingAppLaunchSettingsOverlayIfNeeded()
             self.seedCoreFeatureRecoveryFromPersistedQuitState()

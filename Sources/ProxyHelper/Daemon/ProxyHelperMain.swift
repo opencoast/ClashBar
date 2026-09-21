@@ -541,9 +541,29 @@ private final class ProxyHelperService: NSObject, ProxyHelperProtocol {
         }
     }
 
-    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?) -> Void) {
+    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?, String?) -> Void) {
         let snapshot = self.coreRunner.status()
-        completion(true, snapshot.running, snapshot.pid, snapshot.lastExitCode, nil)
+        completion(true, snapshot.running, snapshot.pid, snapshot.lastExitCode, snapshot.secret, nil)
+    }
+
+    func installPrivilegedCore(
+        authorization: Data,
+        completion: @escaping (Bool, String?, String?) -> Void)
+    {
+        do {
+            // Verified here, not merely on the app side: the app's own
+            // AuthorizationCopyRights call exists to raise the password dialog,
+            // and a malicious client would just skip it.
+            try PrivilegedCoreInstaller.verifyAuthorization(authorization)
+
+            let sourceFD = try PrivilegedCoreRunner.openUserManagedCore(clientUID: self.clientUID)
+            defer { close(sourceFD) }
+
+            let digest = try PrivilegedCoreInstaller.install(clientUID: self.clientUID, sourceFD: sourceFD)
+            completion(true, digest, nil)
+        } catch {
+            completion(false, nil, error.localizedDescription)
+        }
     }
 
     func privilegedCoreInfo(completion: @escaping (Bool, Bool, String?, String?) -> Void) {
@@ -573,6 +593,12 @@ private final class ProxyHelperListenerDelegate: NSObject, NSXPCListenerDelegate
 @main
 private struct ClashBarProxyHelperMain {
     static func main() {
+        // Best-effort: an unregistered right falls back to the system default
+        // rule, which also requires admin authentication, so a failure here
+        // costs us the custom prompt wording and the no-caching timeout rather
+        // than the gate itself.
+        PrivilegedCoreInstaller.registerRightIfNeeded()
+
         let delegate = ProxyHelperListenerDelegate()
         let listener = NSXPCListener(machServiceName: ProxyHelperConstants.machServiceName)
         listener.delegate = delegate

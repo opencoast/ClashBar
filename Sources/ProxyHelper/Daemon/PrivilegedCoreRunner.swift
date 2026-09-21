@@ -74,6 +74,9 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
     private var logHandle: FileHandle?
     private var lastExitCode = ProxyHelperConstants.unknownExitCode
     private var intentionalStop = false
+    /// Secret of the core currently running. Survives helper reconnects for as
+    /// long as the helper process lives, and is handed back via `coreStatus`.
+    private var currentSecret: String?
 
     private init() {}
 
@@ -88,8 +91,16 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         controllerPort: Int,
         clientUID: uid_t) throws -> (pid: Int, secret: String)
     {
+        // A core left over from a previous session (helper recycled, app crashed)
+        // must not wedge every future start. We can prove it is ours -- the
+        // pidfile lives in a root-only directory and `isOurCore` compares the
+        // executable path -- so stop it and start clean rather than throwing.
         if let running = self.currentRunningPID() {
-            throw PrivilegedCoreError.alreadyRunning(pid: running)
+            Self.appendHelperNote("[helper] reclaiming leftover privileged core pid=\(running)")
+            try self.stop()
+            if let stillRunning = self.currentRunningPID() {
+                throw PrivilegedCoreError.alreadyRunning(pid: stillRunning)
+            }
         }
 
         let uid = try CoreLaunchValidation.validatedClientUID(UInt32(clientUID))
@@ -155,6 +166,7 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
             self.logHandle = handle
             self.intentionalStop = false
             self.lastExitCode = ProxyHelperConstants.unknownExitCode
+            self.currentSecret = secret
         }
         Self.writePIDFile(pid)
         // Never log the secret.
@@ -198,16 +210,19 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         self.finishStop()
     }
 
-    func status() -> (running: Bool, pid: Int, lastExitCode: Int) {
-        let snapshot: (Process?, Int) = self.lock.withLock { (self.process, self.lastExitCode) }
+    func status() -> (running: Bool, pid: Int, lastExitCode: Int, secret: String?) {
+        let snapshot: (Process?, Int, String?) = self.lock
+            .withLock { (self.process, self.lastExitCode, self.currentSecret) }
 
         if let proc = snapshot.0, proc.isRunning {
-            return (true, Int(proc.processIdentifier), snapshot.1)
+            return (true, Int(proc.processIdentifier), snapshot.1, snapshot.2)
         }
         if let orphan = Self.readPIDFile(), Self.isAlive(orphan), Self.isOurCore(pid: pid_t(orphan)) {
-            return (true, orphan, snapshot.1)
+            // Reparented to launchd but still ours; the secret is only known if
+            // this helper process started it.
+            return (true, orphan, snapshot.1, snapshot.2)
         }
-        return (false, 0, snapshot.1)
+        return (false, 0, snapshot.1, nil)
     }
 
     func installedCoreSHA256() -> String? {
@@ -229,6 +244,7 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
             self.logHandle = nil
             let wasIntentional = self.intentionalStop
             self.intentionalStop = false
+            self.currentSecret = nil
             return !wasIntentional
         }
         Self.removePIDFile()
@@ -243,6 +259,7 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
             try? self.logHandle?.close()
             self.logHandle = nil
             self.intentionalStop = false
+            self.currentSecret = nil
         }
         Self.removePIDFile()
     }
@@ -260,8 +277,18 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
     // anywhere in the chain fails with ELOOP instead of redirecting a root read.
 
     private static let userConfigPathComponents = ["Library", "Application Support", "clashbar", "config"]
+    private static let userCorePathComponents = ["Library", "Application Support", "clashbar", "core"]
 
-    private static func readUserConfig(clientUID: uid_t, fileName: String) throws -> Data {
+    /// Opens a file under the caller's home directory, verifying every component
+    /// on the way down. Callers own the returned descriptor.
+    ///
+    /// Used for both the config and the core binary: each is read by root out of
+    /// a user-controlled tree, so neither may be reached by a plain path.
+    static func openUserFile(
+        clientUID: uid_t,
+        components: [String],
+        fileName: String) throws -> Int32
+    {
         guard let entry = getpwuid(clientUID) else {
             throw PrivilegedCoreError.untrustedClientUID(clientUID)
         }
@@ -276,29 +303,53 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         guard dirFD >= 0 else {
             throw PrivilegedCoreError.pathNotTrusted(component: home, reason: "open failed (errno \(errno))")
         }
-        defer { if dirFD >= 0 { close(dirFD) } }
         try Self.verifyDirectoryFD(dirFD, component: home, expectedUID: clientUID)
 
-        for component in Self.userConfigPathComponents {
+        for component in components {
             let next = openat(dirFD, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard next >= 0 else {
                 // ELOOP here means the component is a symlink, which is exactly
                 // the attack we are refusing.
+                let captured = errno
+                close(dirFD)
                 throw PrivilegedCoreError.pathNotTrusted(
                     component: component,
-                    reason: errno == ELOOP ? "is a symbolic link" : "openat failed (errno \(errno))")
+                    reason: captured == ELOOP ? "is a symbolic link" : "openat failed (errno \(captured))")
             }
             close(dirFD)
             dirFD = next
-            try Self.verifyDirectoryFD(dirFD, component: component, expectedUID: clientUID)
+            do {
+                try Self.verifyDirectoryFD(dirFD, component: component, expectedUID: clientUID)
+            } catch {
+                close(dirFD)
+                throw error
+            }
         }
 
         let fileFD = openat(dirFD, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let captured = errno
+        close(dirFD)
         guard fileFD >= 0 else {
             throw PrivilegedCoreError.configUnreadable(
                 path: fileName,
-                reason: errno == ELOOP ? "is a symbolic link" : "openat failed (errno \(errno))")
+                reason: captured == ELOOP ? "is a symbolic link" : "openat failed (errno \(captured))")
         }
+        return fileFD
+    }
+
+    /// Opens the user's managed core for the installer.
+    static func openUserManagedCore(clientUID: uid_t) throws -> Int32 {
+        try self.openUserFile(
+            clientUID: clientUID,
+            components: Self.userCorePathComponents,
+            fileName: "mihomo")
+    }
+
+    private static func readUserConfig(clientUID: uid_t, fileName: String) throws -> Data {
+        let fileFD = try self.openUserFile(
+            clientUID: clientUID,
+            components: Self.userConfigPathComponents,
+            fileName: fileName)
         defer { close(fileFD) }
 
         var st = stat()
@@ -377,6 +428,25 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         // something other than this helper put it there.
         guard (st.st_mode & mode_t(S_ISUID)) == 0 else {
             throw PrivilegedCoreError.coreNotTrusted(path: path, reason: "unexpected setuid bit")
+        }
+
+        // The digest sidecar records what the user actually authorised. Checking
+        // it here is what turns the hash from decoration into a gate: the file is
+        // root-owned in a root-owned directory, so the app cannot forge it, and a
+        // core swapped in by any other means fails to start.
+        guard let recorded = PrivilegedCoreInstaller.recordedDigest() else {
+            throw PrivilegedCoreError.coreNotTrusted(
+                path: path,
+                reason: "no authorised digest recorded; reinstall the privileged core")
+        }
+        guard let data = FileManager.default.contents(atPath: path) else {
+            throw PrivilegedCoreError.coreNotTrusted(path: path, reason: "cannot read for digest verification")
+        }
+        let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard actual == recorded else {
+            throw PrivilegedCoreError.coreNotTrusted(
+                path: path,
+                reason: "digest does not match the authorised core; reinstall it")
         }
     }
 

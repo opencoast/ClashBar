@@ -156,17 +156,47 @@ extension AppViewModel {
             // copyable from the log pane, then propagate.
             switch error {
             case .permissionMissing, .privilegedCoreStale:
-                if requestIfMissing {
+                guard requestIfMissing else { throw error }
+                appendLog(level: "info", message: tr("log.tun.permission_requesting"))
+                do {
+                    let digest = try await self.tunPermissionRepository
+                        .installPrivilegedCore(binaryPath: binaryPath)
+                    appendLog(
+                        level: "info",
+                        message: tr("log.tun.privileged_core_installed", String(digest.prefix(16))))
+                } catch let authError as PrivilegedInstallAuthorizationError {
+                    // Cancelling is a normal outcome, not a failure to report as
+                    // a defect.
+                    throw authError
+                } catch {
+                    // The helper may be unreachable (unregistered, not approved).
+                    // Fall back to telling the user what to run by hand so the
+                    // feature is not a dead end.
                     appendLog(
                         level: "warning",
                         message: tr(
                             "log.tun.manual_install_required",
                             self.tunPermissionRepository.installCommand(binaryPath: binaryPath)))
+                    throw error
                 }
             default:
-                break
+                throw error
             }
-            throw error
+        }
+    }
+
+    /// Adopts a privileged core left running by a previous session, together
+    /// with its controller secret, and records that the privileged backend is
+    /// the active one so the UI does not offer to start a second core.
+    func reconcileWithPrivilegedHelperAtLaunch() async {
+        guard let router = self.processManager as? CoreBackendRouter else { return }
+        await router.reconcileWithHelperAtLaunch()
+        guard router.isRunning, router.requiresPrivilegedBackend else { return }
+        appendLog(level: "info", message: tr("log.tun.adopted_privileged_core"))
+        self.adoptPrivilegedControllerSecretIfNeeded()
+        if !self.isTunEnabled {
+            self.isTunEnabled = true
+            persistEditableSettingsSnapshot()
         }
     }
 

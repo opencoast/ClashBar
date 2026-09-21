@@ -427,3 +427,6 @@
 
 "log.tun.manual_install_required" = "TUN needs a root-owned copy of the core. This app performs no root file operations; run this yourself:\n%@";
 "log.tun.controller_secret_injected" = "Adopted the controller secret injected by the privileged helper.";
+"log.tun.adopted_privileged_core" = "Adopted the privileged core left running by a previous session, including its controller secret.";
+"log.tun.privileged_core_installed" = "Privileged core installed and authorised (digest %@…).";
+"app.tun.error.authorization_cancelled_install" = "Administrator authorization was cancelled; the privileged core was not installed.";

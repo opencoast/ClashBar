@@ -32,7 +32,7 @@ final class PrivilegedCoreController: MihomoControlling, MihomoLogObserving, @un
     /// Set after a successful privileged start. The helper strips the user's own
     /// `secret` and injects its own, so the app must pick this up or every API
     /// call to the root core will fail authentication.
-    private(set) var injectedControllerSecret: String?
+    fileprivate(set) var injectedControllerSecret: String?
 
     /// - Parameter validator: used for `mihomo -t`, which needs no privilege and
     ///   is best run as the user against the user's own copy of the config.
@@ -127,6 +127,9 @@ final class PrivilegedCoreController: MihomoControlling, MihomoLogObserving, @un
         self.lock.withLock {
             self.intentionalStop = false
             self.storedStatus = .running(pid: Int32(snapshot.pid))
+            // Without this the app cannot authenticate against a core it did not
+            // start in this session: every request comes back 401.
+            self.injectedControllerSecret = snapshot.secret
         }
         self.logTail.start(fromEnd: true)
         self.startPolling()

@@ -110,15 +110,20 @@ struct TunPermissionService {
         return (st.st_mode & mode_t(S_ISUID)) != 0 || st.st_uid == 0
     }
 
-    /// Kept to satisfy `TunPermissionRepository`. It cannot grant anything any
-    /// more; it reports the command to run.
-    func grantPermissions(binaryPath: String) async throws {
+    /// Installs the privileged core via the helper, behind an administrator
+    /// prompt.
+    ///
+    /// Note what this method does **not** do: it performs no file operations
+    /// itself. The app is unprivileged, the helper is already root, and the
+    /// password dialog is what authorises *these bytes* to run as root. See the
+    /// type comment for why doing the copy here — as the earlier `osascript`
+    /// version did — is unsafe at any level of shell hardening.
+    func installPrivilegedCore(binaryPath: String, service: PrivilegedCoreService) async throws -> String {
         let managedPath = try self.validateBinaryPath(binaryPath)
-        do {
-            try self.validateCurrentPermissions(binaryPath: managedPath)
-        } catch {
-            throw error
-        }
+        let digest = try await service.installPrivilegedCore()
+        // Confirm the helper really produced a core we would be willing to run.
+        try self.validateCurrentPermissions(binaryPath: managedPath)
+        return digest
     }
 
     // MARK: - Trust checks
@@ -206,9 +211,11 @@ struct TunPermissionService {
 @MainActor
 final class DefaultTunPermissionRepository: TunPermissionRepository {
     private let service: TunPermissionService
+    private let privilegedCoreService: PrivilegedCoreService
 
-    init(service: TunPermissionService) {
+    init(service: TunPermissionService, privilegedCoreService: PrivilegedCoreService = PrivilegedCoreService()) {
         self.service = service
+        self.privilegedCoreService = privilegedCoreService
     }
 
     func hasRequiredPermissions(binaryPath: String) -> Bool {
@@ -219,8 +226,11 @@ final class DefaultTunPermissionRepository: TunPermissionRepository {
         try self.service.validateCurrentPermissions(binaryPath: binaryPath)
     }
 
-    func grantPermissions(binaryPath: String) async throws {
-        try await self.service.grantPermissions(binaryPath: binaryPath)
+    @discardableResult
+    func installPrivilegedCore(binaryPath: String) async throws -> String {
+        try await self.service.installPrivilegedCore(
+            binaryPath: binaryPath,
+            service: self.privilegedCoreService)
     }
 
     func legacySetuidPresent(binaryPath: String) -> Bool {

@@ -35,6 +35,18 @@ public enum ProxyHelperConstants {
     /// the XPC connection -- never against a path supplied by the client.
     public static let userConfigDirectoryRelativePath = "Library/Application Support/clashbar/config"
 
+    /// Sidecar recording the digest of the core the user authorised. Root-only,
+    /// so the app cannot forge it; `startCore` re-checks the binary against it
+    /// before spawning, which is what makes the hash load-bearing rather than
+    /// decorative.
+    public static let privilegedCoreDigestPath = privilegedCoreDirectoryPath + "/mihomo.sha256"
+
+    /// Authorization Services right gating the install. Registered by the helper
+    /// with `timeout: 0` so the credential is never cached: every install of new
+    /// bytes re-prompts, because that prompt *is* the user's statement that these
+    /// particular bytes may run as root.
+    public static let installCoreRightName = "com.clashbar.helper.install-core"
+
     public static let maximumCoreLogBytes = 4 * 1024 * 1024
     public static let maximumConfigBytes = 5 * 1024 * 1024
 
@@ -91,13 +103,34 @@ public protocol ProxyHelperProtocol {
     /// Stops the privileged core. Succeeds when nothing is running.
     func stopCore(completion: @escaping (Bool, String?) -> Void)
 
-    /// `(ok, running, pid, lastExitCode, message)`. `pid` is 0 when not running;
-    /// `lastExitCode` is `ProxyHelperConstants.unknownExitCode` when the core has
-    /// not exited yet.
-    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?) -> Void)
+    /// `(ok, running, pid, lastExitCode, secret, message)`. `pid` is 0 when not
+    /// running; `lastExitCode` is `ProxyHelperConstants.unknownExitCode` when the
+    /// core has not exited yet.
+    ///
+    /// `secret` is the token of the *currently running* core. It has to be
+    /// recoverable: the app keeps it only in memory, so after an app restart (or
+    /// a helper reconnect) it would otherwise be talking to a live root core it
+    /// can no longer authenticate against, and every call returns 401.
+    func coreStatus(completion: @escaping (Bool, Bool, Int, Int, String?, String?) -> Void)
 
     /// Reports whether a usable privileged core is installed, and the SHA-256 of
     /// its bytes so the app can tell a stale copy from a current one.
     /// `(ok, installed, sha256Hex, message)`.
     func privilegedCoreInfo(completion: @escaping (Bool, Bool, String?, String?) -> Void)
+
+    /// Installs the user's managed core as the root-owned privileged core.
+    ///
+    /// - Parameter authorization: an `AuthorizationExternalForm` blob for
+    ///   `installCoreRightName`. The helper re-verifies the right itself; the
+    ///   app-side check only exists to raise the password dialog, and a
+    ///   malicious client could simply skip it.
+    /// - Parameter completion: `(ok, installedSHA256, message)`.
+    ///
+    /// The source is **not** a parameter: it is resolved from the connection's
+    /// audited euid, through an `openat` chain, exactly like the config. A path
+    /// from the client would let a caller nominate any readable file to be
+    /// installed and executed as root.
+    func installPrivilegedCore(
+        authorization: Data,
+        completion: @escaping (Bool, String?, String?) -> Void)
 }

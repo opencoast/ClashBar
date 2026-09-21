@@ -38,6 +38,10 @@ final class PrivilegedCoreService: @unchecked Sendable {
         let running: Bool
         let pid: Int
         let lastExitCode: Int
+        /// Token of the running core, so it can be recovered after an app
+        /// restart instead of leaving us unable to authenticate against a live
+        /// root core.
+        let secret: String?
     }
 
     struct Started: Sendable {
@@ -98,12 +102,39 @@ final class PrivilegedCoreService: @unchecked Sendable {
 
     func coreStatus() async throws -> Snapshot {
         try await self.invoke { helper, done in
-            helper.coreStatus { ok, running, pid, lastExitCode, message in
+            helper.coreStatus { ok, running, pid, lastExitCode, secret, message in
                 if ok {
-                    done(.success(Snapshot(running: running, pid: pid, lastExitCode: lastExitCode)))
+                    done(.success(Snapshot(
+                        running: running,
+                        pid: pid,
+                        lastExitCode: lastExitCode,
+                        secret: secret)))
                 } else {
                     done(.failure(PrivilegedCoreServiceError.operationFailed(
                         message ?? "coreStatus failed without a message.")))
+                }
+            }
+        }
+    }
+
+    /// Prompts for administrator authorization, then has the helper install the
+    /// user's managed core as the root-owned privileged core.
+    ///
+    /// - Returns: the SHA-256 of the installed bytes, so the caller can show the
+    ///   user exactly what was authorised.
+    func installPrivilegedCore() async throws -> String {
+        // The dialog blocks its thread; keep it off the main actor.
+        let blob = try await Task.detached(priority: .userInitiated) {
+            try PrivilegedCoreInstallAuthorization.requestExternalForm()
+        }.value
+
+        return try await self.invoke { helper, done in
+            helper.installPrivilegedCore(authorization: blob) { ok, digest, message in
+                if ok, let digest {
+                    done(.success(digest))
+                } else {
+                    done(.failure(PrivilegedCoreServiceError.operationFailed(
+                        message ?? "installPrivilegedCore failed without a message.")))
                 }
             }
         }
@@ -164,21 +195,34 @@ final class PrivilegedCoreService: @unchecked Sendable {
             machServiceName: ProxyHelperConstants.machServiceName,
             options: .privileged)
         connection.remoteObjectInterface = NSXPCInterface(with: ProxyHelperProtocol.self)
-        // The listener already pins the *client*; pin the daemon from this side
-        // too, so the app will not hand a config filename to something that
-        // merely grabbed the Mach name.
-        connection.setCodeSigningRequirement(Self.helperCodeSigningRequirement())
+        // Pin the daemon from this side too, so the app will not hand a config
+        // filename to something that merely grabbed the Mach name. Upstream never
+        // did this, which is why it is gated: an ad-hoc signature has no
+        // certificate chain, and requiring one on a development build makes every
+        // call fail with "Couldn't communicate with a helper application" even
+        // though the helper is running fine. Mirror the posture
+        // `SystemProxyService.validateHelperSigningRequirements` already takes --
+        // unsigned on both ends means no check -- rather than installing a
+        // degraded requirement that cannot be satisfied.
+        if let requirement = Self.helperCodeSigningRequirement() {
+            connection.setCodeSigningRequirement(requirement)
+        }
         connection.activate()
         return connection
     }
 
-    /// Mirrors the requirement the helper applies to us. Degrades to the bare
-    /// identifier for ad-hoc/unsigned development builds, which is the same
-    /// degradation `main.swift` already accepts.
-    static func helperCodeSigningRequirement() -> String {
-        let base = ProxyHelperConstants.allowedHelperRequirement
-        guard let team = self.selfTeamIdentifier(), !team.isEmpty else { return base }
-        return "\(base) and certificate leaf[subject.OU] = \"\(team)\""
+    /// The requirement to pin the daemon with, or nil when this build is not
+    /// properly signed and therefore cannot satisfy one.
+    ///
+    /// Returning nil is a real reduction in defence, and it is why a Developer ID
+    /// is load-bearing for this design: on an ad-hoc build anything that can
+    /// claim the Mach name can answer. It is not a reason to ship an
+    /// unsatisfiable requirement instead -- that just breaks the feature while
+    /// providing no protection either.
+    static func helperCodeSigningRequirement() -> String? {
+        guard let team = self.selfTeamIdentifier(), !team.isEmpty else { return nil }
+        return "\(ProxyHelperConstants.allowedHelperRequirement) " +
+            "and certificate leaf[subject.OU] = \"\(team)\""
     }
 
     private static func selfTeamIdentifier() -> String? {

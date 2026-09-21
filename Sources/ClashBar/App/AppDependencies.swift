@@ -23,7 +23,10 @@ struct AppDependencies {
         let childProcessManager = MihomoProcessManager(workingDirectoryManager: workingDirectoryManager)
         // The privileged backend asks the root helper to spawn the core. It
         // reuses the child manager for `mihomo -t`, which needs no privilege.
-        let privilegedController = PrivilegedCoreController(validator: childProcessManager)
+        let privilegedCoreService = PrivilegedCoreService()
+        let privilegedController = PrivilegedCoreController(
+            service: privilegedCoreService,
+            validator: childProcessManager)
         let processManager = CoreBackendRouter(
             unprivileged: childProcessManager,
             privileged: privilegedController)
@@ -49,7 +52,9 @@ struct AppDependencies {
             coreRepository: DefaultCoreRepository(processManager: processManager),
             configRepository: configRepository,
             systemProxyRepository: DefaultSystemProxyRepository(service: SystemProxyService()),
-            tunPermissionRepository: DefaultTunPermissionRepository(service: TunPermissionService()),
+            tunPermissionRepository: DefaultTunPermissionRepository(
+                service: TunPermissionService(),
+                privilegedCoreService: privilegedCoreService),
             launchAtLoginRepository: DefaultLaunchAtLoginRepository(service: AppLaunchService()),
             workingDirectoryManager: workingDirectoryManager,
             networkReachabilityMonitor: NetworkReachabilityMonitor(),

@@ -427,3 +427,6 @@
 
 "log.tun.manual_install_required" = "TUN 需要一份 root 持有的内核副本。本应用不执行任何 root 文件操作，请手动执行：\n%@";
 "log.tun.controller_secret_injected" = "已采用特权 helper 注入的控制器密钥。";
+"log.tun.adopted_privileged_core" = "已接管上一次会话留下的特权内核（含其控制器密钥）。";
+"log.tun.privileged_core_installed" = "特权内核已安装并授权（摘要 %@…）。";
+"app.tun.error.authorization_cancelled_install" = "已取消管理员授权，未安装特权内核。";
