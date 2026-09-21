@@ -451,10 +451,16 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
     /// Guards against a recycled PID pointing at some unrelated process: the
     /// recorded pid must still be *our* executable before we signal it.
     private static func isOurCore(pid: pid_t) -> Bool {
-        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
-        let written = proc_pidpath(pid, &buffer, UInt32(PATH_MAX))
+        var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX))
+        let written = buffer.withUnsafeMutableBytes { raw in
+            proc_pidpath(pid, raw.baseAddress, UInt32(raw.count))
+        }
         guard written > 0 else { return false }
-        return String(cString: buffer) == ProxyHelperConstants.privilegedCoreBinaryPath
+        // `proc_pidpath` returns the byte length of the path; decode exactly that
+        // many bytes rather than relying on the deprecated NUL-scanning
+        // `String(cString:)`.
+        let path = String(decoding: buffer.prefix(Int(written)), as: UTF8.self)
+        return path == ProxyHelperConstants.privilegedCoreBinaryPath
     }
 
     private static func waitForExit(of pid: pid_t, timeout: TimeInterval) -> Bool {

@@ -79,10 +79,26 @@ jobs:
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           exit 0
 
+      # A failing `emit-module` aborts the whole build, so one bad module hides
+      # every other module's errors. Building each target on its own gets us
+      # diagnostics from all of them in a single CI round.
+      - name: Per-target build (only when the whole-package build failed)
+        if: always() && steps.build.outputs.exit_code != '0'
+        run: |
+          set +e
+          for t in ProxyHelperShared ClashBarProxyHelper ClashBar; do
+            echo "═════════ target: $t ═════════"
+            swift build -c ${{ matrix.configuration }} --target "$t" 2>&1
+            echo "───────── $t exit: $? ─────────"
+          done | tee per-target.log
+          exit 0
+
       - name: Collect diagnostics
         if: always()
         run: |
           CFG="${{ matrix.configuration }}"
+          # Fold the per-target pass in, if it ran.
+          [ -f per-target.log ] && cat per-target.log >> build.log
 
           # Header lines from swiftc are `path:line:col: error|warning: message`,
           # in both the `swift` and `llvm` diagnostic styles.
@@ -151,6 +167,7 @@ jobs:
           name: build-logs-${{ matrix.configuration }}
           path: |
             build.log
+            per-target.log
             diags.txt
             errors.txt
             warnings.txt
