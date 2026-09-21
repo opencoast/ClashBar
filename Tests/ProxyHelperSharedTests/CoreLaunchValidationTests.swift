@@ -127,6 +127,30 @@ final class PrivilegedControllerEndpointTests: XCTestCase {
         XCTAssertEqual(try PrivilegedControllerEndpoint.parse("127.0.0.1", defaultPort: 19090).port, 19090)
     }
 
+    /// Regression: `::1` was being split on its *last* colon, yielding host ":"
+    /// (rewritten to 127.0.0.1) and port 1. A bare IPv6 literal has no port,
+    /// because attaching one requires brackets.
+    func testBareIPv6LiteralIsNotSplitOnItsOwnColons() throws {
+        let loopback = try PrivilegedControllerEndpoint.parse("::1")
+        XCTAssertEqual(loopback.host, "::1")
+        XCTAssertEqual(loopback.port, 9090)
+
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("::").host, "::1")
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("::").port, 9090)
+
+        // A non-loopback IPv6 literal is still narrowed to loopback.
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("fe80::1").host, "127.0.0.1")
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("fe80::1").port, 9090)
+
+        // Unbracketed IPv6-with-port is malformed; treat the whole thing as a
+        // host and narrow it rather than guessing a port out of it.
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("::1:9090").host, "127.0.0.1")
+
+        // IPv4 still splits normally.
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse("127.0.0.1:9090").port, 9090)
+        XCTAssertEqual(try PrivilegedControllerEndpoint.parse(":9090").port, 9090)
+    }
+
     func testRejectsGarbage() {
         XCTAssertThrowsError(try PrivilegedControllerEndpoint.parse(""))
         XCTAssertThrowsError(try PrivilegedControllerEndpoint.parse("127.0.0.1:99999"))

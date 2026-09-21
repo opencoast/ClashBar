@@ -121,18 +121,16 @@ public struct PrivilegedControllerEndpoint: Equatable, Sendable {
             hostPart = String(trimmed[trimmed.index(after: trimmed.startIndex)..<close])
             let rest = trimmed[trimmed.index(after: close)...]
             portPart = rest.hasPrefix(":") ? String(rest.dropFirst()) : nil
+        } else if trimmed.filter({ $0 == ":" }).count > 1 {
+            // More than one colon and no brackets means a bare IPv6 literal:
+            // attaching a port to IPv6 requires brackets, so there is no port
+            // here. Splitting on the last colon would turn `::1` into host ":"
+            // and port 1.
+            hostPart = trimmed
+            portPart = nil
         } else if let separator = trimmed.lastIndex(of: ":") {
-            // `::1` (bare IPv6 loopback, no port) has no host part before the
-            // last colon; treat that as host-only.
-            let head = String(trimmed[trimmed.startIndex..<separator])
-            let tail = String(trimmed[trimmed.index(after: separator)...])
-            if head.isEmpty || Int(tail) == nil {
-                hostPart = trimmed
-                portPart = nil
-            } else {
-                hostPart = head
-                portPart = tail
-            }
+            hostPart = String(trimmed[trimmed.startIndex..<separator])
+            portPart = String(trimmed[trimmed.index(after: separator)...])
         } else {
             hostPart = trimmed
             portPart = nil
