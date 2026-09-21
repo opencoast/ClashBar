@@ -32,6 +32,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
       build_number: ${{ steps.version.outputs.build_number }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,13 +48,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # `version` feeds APP_VERSION -> CFBundleShortVersionString and
+          # BUILD_NUMBER -> CFBundleVersion, and Apple requires both to be
+          # period-separated integers. So a prerelease suffix is allowed in the
+          # *tag* only, and is stripped out of `version`.
           extract_version() {
             local raw="$1"
-            if [[ "$raw" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            if [[ "$raw" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
               echo "${BASH_REMATCH[1]}"
               return 0
             fi
             return 1
+          }
+
+          # Non-empty when the tag carries a suffix such as -dev, -rc.1, -beta.2.
+          prerelease_suffix() {
+            local raw="$1"
+            if [[ "$raw" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)$ ]]; then
+              echo "${BASH_REMATCH[1]#-}"
+            fi
           }
 
           normalize_manual_tag() {
@@ -145,9 +158,21 @@ jobs:
             fi
           fi
 
+          suffix="$(prerelease_suffix "$tag")"
+          build_number="${version}"
+          is_prerelease="false"
+          if [[ -n "$suffix" ]]; then
+            is_prerelease="true"
+            # Two builds of v0.4.0-dev would otherwise ship an identical
+            # CFBundleVersion, which breaks any version comparison downstream.
+            build_number="${version}.${GITHUB_RUN_NUMBER}"
+            echo "Prerelease tag detected (suffix: ${suffix}); version stays ${version}."
+          fi
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "build_number=${version}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
 
   build-dmg:
     needs: prepare-version
@@ -255,7 +280,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-version.outputs.tag }}
-          name: ClashBar ${{ needs.prepare-version.outputs.version }}
+          name: ClashBar ${{ needs.prepare-version.outputs.tag }}
+          prerelease: ${{ needs.prepare-version.outputs.prerelease == 'true' }}
           body_path: release.md
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -266,6 +292,9 @@ jobs:
   update-formula:
     runs-on: ubuntu-latest
     needs: [prepare-version, release]
+    # A prerelease must not move the Homebrew cask; `brew install --cask clashbar`
+    # would start handing users a -dev build.
+    if: needs.prepare-version.outputs.prerelease != 'true'
     permissions:
       contents: read
     steps:
