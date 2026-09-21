@@ -1,4 +1,4 @@
-## v0.4.0-dev (privileged-helper-core)
+## v0.4.0
 
 ![macOS](https://img.shields.io/badge/macOS-Supported-000000?style=flat-square&logo=apple) ![Core](https://img.shields.io/badge/Core-Mihomo-6366f1?style=flat-square) ![Status](https://img.shields.io/badge/Status-Not%20for%20release-EF4444?style=flat-square)
 
