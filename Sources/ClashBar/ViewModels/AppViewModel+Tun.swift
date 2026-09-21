@@ -101,16 +101,10 @@ extension AppViewModel {
             switch permissionError {
             case .coreBinaryNotFound, .coreBinaryNotExecutable:
                 return tr("app.tun.error.binary_not_found", workingDirectoryManager.coreDirectoryURL.path)
-            case .permissionMissing:
-                return tr("app.tun.error.permission_missing")
-            case .authorizationCancelled:
-                return tr("app.tun.error.authorization_cancelled")
-            case let .authorizationFailed(message):
-                return tr("app.tun.error.authorization_failed", message)
-            case .permissionVerificationFailed:
-                return tr("app.tun.error.permission_verify_failed")
-            case .privilegedCoreStale:
-                return tr("app.tun.error.privileged_core_stale")
+            case let .permissionMissing(command):
+                return tr("app.tun.error.permission_missing", command)
+            case let .privilegedCoreStale(command):
+                return tr("app.tun.error.privileged_core_stale", command)
             case let .privilegedCoreNotTrusted(reason):
                 return tr("app.tun.error.privileged_core_untrusted", reason)
             case let .hashingFailed(message):
@@ -156,23 +150,48 @@ extension AppViewModel {
         do {
             try self.tunPermissionRepository.validateCurrentPermissions(binaryPath: binaryPath)
         } catch let error as TunPermissionServiceError {
-            // `permissionMissing` means no privileged core yet; `stale` means the
-            // managed core was updated and the root copy no longer matches its
-            // bytes. Both are fixed by the same one-prompt install.
-            let installable: Bool
+            // The app performs no root file operations, so there is nothing to
+            // "request" -- both `permissionMissing` and `privilegedCoreStale`
+            // are resolved by a command the user runs. Log it once so it is
+            // copyable from the log pane, then propagate.
             switch error {
             case .permissionMissing, .privilegedCoreStale:
-                installable = true
+                if requestIfMissing {
+                    appendLog(
+                        level: "warning",
+                        message: tr(
+                            "log.tun.manual_install_required",
+                            self.tunPermissionRepository.installCommand(binaryPath: binaryPath)))
+                }
             default:
-                installable = false
+                break
             }
-            guard installable else { throw error }
-            guard requestIfMissing else { throw error }
-
-            appendLog(level: "info", message: tr("log.tun.permission_requesting"))
-            try await self.tunPermissionRepository.grantPermissions(binaryPath: binaryPath)
-            appendLog(level: "info", message: tr("log.tun.permission_granted"))
+            throw error
         }
+    }
+
+    /// The secret the helper generated for the currently running privileged
+    /// core, or nil when no privileged core is running.
+    var injectedPrivilegedSecret: String? {
+        (self.processManager as? CoreBackendRouter)?.injectedControllerSecret
+    }
+
+    /// The helper strips the user's `secret` from the staged config and injects
+    /// its own, so after a privileged start the API client has to be rebuilt with
+    /// that token. Called from both `startCore` and `restartCore`.
+    func adoptPrivilegedControllerSecretIfNeeded() {
+        let injected = self.injectedPrivilegedSecret
+        let normalized = injected?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let normalized, !normalized.isEmpty else {
+            // Back on the unprivileged backend: let the config-derived secret
+            // take over again on the next sync.
+            return
+        }
+        guard self.controllerSecret != normalized else { return }
+        self.controllerSecret = normalized
+        self.refreshControllerUIURL()
+        self.ensureAPIClient()
+        appendLog(level: "info", message: tr("log.tun.controller_secret_injected"))
     }
 
     /// True when the next core launch will go through the privileged helper.
@@ -194,7 +213,12 @@ extension AppViewModel {
     func warnAboutLegacySetuidCoreIfNeeded() {
         guard let binaryPath = resolvedMihomoBinaryPath() else { return }
         guard self.tunPermissionRepository.legacySetuidPresent(binaryPath: binaryPath) else { return }
-        appendLog(level: "warning", message: tr("log.tun.legacy_setuid_detected", binaryPath))
+        appendLog(
+            level: "warning",
+            message: tr(
+                "log.tun.legacy_setuid_detected",
+                binaryPath,
+                self.tunPermissionRepository.legacyCleanupCommand(binaryPath: binaryPath)))
     }
 
     func verifyTunAfterOverlayIfNeeded(overlay: EditableSettingsSnapshot) async {

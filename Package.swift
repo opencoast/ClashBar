@@ -27,4 +27,11 @@ let package = Package(
             name: "ClashBarProxyHelper",
             dependencies: ["ProxyHelperShared"],
             path: "Sources/ProxyHelper/Daemon"),
+        // The privileged path cannot be exercised without a Developer ID, so
+        // everything that decides what the root core runs lives in
+        // ProxyHelperShared and is pinned by these tests instead.
+        .testTarget(
+            name: "ProxyHelperSharedTests",
+            dependencies: ["ProxyHelperShared"],
+            path: "Tests/ProxyHelperSharedTests"),
     ])

@@ -19,6 +19,8 @@ enum PrivilegedCoreError: LocalizedError {
     case stagingFailed(reason: String)
     case launchFailed(reason: String)
     case alreadyRunning(pid: Int)
+    case pathNotTrusted(component: String, reason: String)
+    case configOwnerMismatch(expected: uid_t, actual: uid_t)
 
     var errorDescription: String? {
         switch self {
@@ -46,6 +48,10 @@ enum PrivilegedCoreError: LocalizedError {
             "Failed to launch privileged core: \(reason)"
         case let .alreadyRunning(pid):
             "Privileged core is already running (pid \(pid))."
+        case let .pathNotTrusted(component, reason):
+            "Refusing to traverse '\(component)': \(reason)"
+        case let .configOwnerMismatch(expected, actual):
+            "Config is owned by uid \(actual), expected \(expected)."
         }
     }
 }
@@ -59,6 +65,10 @@ enum PrivilegedCoreError: LocalizedError {
 final class PrivilegedCoreRunner: @unchecked Sendable {
     static let shared = PrivilegedCoreRunner()
 
+    /// gid 20 on macOS. The console user belongs to it, so `0640 root:staff`
+    /// lets the app read the core log while other accounts cannot.
+    private static let staffGID: gid_t = 20
+
     private let lock = NSLock()
     private var process: Process?
     private var logHandle: FileHandle?
@@ -69,25 +79,45 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
 
     // MARK: - Public surface
 
+    /// - Returns: the pid, plus the controller secret the helper generated and
+    ///   injected into the staged config. The caller must use it as the bearer
+    ///   token; without it the API is unreachable, which is the point.
     func start(
         configFileName: String,
         controllerHost: String,
         controllerPort: Int,
-        clientUID: uid_t) throws -> Int
+        clientUID: uid_t) throws -> (pid: Int, secret: String)
     {
         if let running = self.currentRunningPID() {
             throw PrivilegedCoreError.alreadyRunning(pid: running)
         }
 
-        let name = try Self.validatedConfigFileName(configFileName)
-        let host = try Self.validatedControllerHost(controllerHost)
-        let port = try Self.validatedControllerPort(controllerPort)
-        let sourceConfigURL = try Self.resolveUserConfigURL(clientUID: clientUID, fileName: name)
+        let uid = try CoreLaunchValidation.validatedClientUID(UInt32(clientUID))
+        let name = try CoreLaunchValidation.validatedConfigFileName(configFileName)
+        let host = try CoreLaunchValidation.validatedControllerHost(controllerHost)
+        let port = try CoreLaunchValidation.validatedControllerPort(controllerPort)
 
         try Self.ensurePrivilegedLayout()
         try Self.validatePrivilegedBinary()
-        let configData = try Self.readConfig(at: sourceConfigURL)
-        try Self.stageRuntimeConfig(configData)
+
+        // Read through an openat chain rather than a path: every component of
+        // the user's home is user-controlled, so a leaf-only O_NOFOLLOW would let
+        // a symlinked `config/` directory point the root helper at any file.
+        let configData = try Self.readUserConfig(clientUID: uid_t(uid), fileName: name)
+
+        // The user's config is not a trusted input to a root process. Strip the
+        // control-plane and inbound-exposure keys, then inject a secret so the
+        // root core's API is not open to every local process.
+        let secret = Self.generateSecret()
+        let sanitized = ConfigSanitizer.sanitize(
+            yaml: String(decoding: configData, as: UTF8.self),
+            injectedSecret: secret)
+        if !sanitized.removedKeys.isEmpty {
+            Self.appendHelperNote(
+                "[helper] stripped unsafe top-level keys from staged config: " +
+                    sanitized.removedKeys.joined(separator: ", "))
+        }
+        try Self.stageRuntimeConfig(Data(sanitized.yaml.utf8))
 
         let runDirectoryURL = URL(fileURLWithPath: ProxyHelperConstants.privilegedRunDirectoryPath, isDirectory: true)
         let handle = try Self.openCoreLogHandle()
@@ -127,8 +157,14 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
             self.lastExitCode = ProxyHelperConstants.unknownExitCode
         }
         Self.writePIDFile(pid)
+        // Never log the secret.
         Self.appendHelperNote("[helper] started privileged core pid=\(pid) controller=\(host):\(port) config=\(name)")
-        return pid
+        return (pid: pid, secret: secret)
+    }
+
+    private static func generateSecret() -> String {
+        // SystemRandomNumberGenerator is the platform CSPRNG.
+        (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
     }
 
     func stop() throws {
@@ -216,47 +252,16 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         return status.running ? status.pid : nil
     }
 
-    // MARK: - Input validation
+    // MARK: - Safe path traversal
+    //
+    // `getpwuid` gives us the home directory from the passwd database (not from
+    // the client), but everything below it belongs to the user. We therefore
+    // descend one component at a time with O_NOFOLLOW|O_DIRECTORY, so a symlink
+    // anywhere in the chain fails with ELOOP instead of redirecting a root read.
 
-    private static func validatedConfigFileName(_ raw: String) throws -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 128 else { throw PrivilegedCoreError.invalidConfigFileName }
-        guard trimmed == (trimmed as NSString).lastPathComponent else {
-            throw PrivilegedCoreError.invalidConfigFileName
-        }
-        guard !trimmed.hasPrefix("."), trimmed != "..", !trimmed.contains("/"), !trimmed.contains("\0") else {
-            throw PrivilegedCoreError.invalidConfigFileName
-        }
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        guard trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
-            throw PrivilegedCoreError.invalidConfigFileName
-        }
-        let ext = (trimmed as NSString).pathExtension.lowercased()
-        guard ext == "yaml" || ext == "yml" else { throw PrivilegedCoreError.invalidConfigFileName }
-        return trimmed
-    }
+    private static let userConfigPathComponents = ["Library", "Application Support", "clashbar", "config"]
 
-    private static func validatedControllerHost(_ raw: String) throws -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch trimmed {
-        case "127.0.0.1":
-            return "127.0.0.1"
-        case "::1", "[::1]":
-            return "[::1]"
-        default:
-            throw PrivilegedCoreError.invalidControllerHost
-        }
-    }
-
-    private static func validatedControllerPort(_ raw: Int) throws -> Int {
-        guard (1...65535).contains(raw) else { throw PrivilegedCoreError.invalidControllerPort }
-        return raw
-    }
-
-    private static func resolveUserConfigURL(clientUID: uid_t, fileName: String) throws -> URL {
-        guard clientUID != 0, clientUID >= 500 else {
-            throw PrivilegedCoreError.untrustedClientUID(clientUID)
-        }
+    private static func readUserConfig(clientUID: uid_t, fileName: String) throws -> Data {
         guard let entry = getpwuid(clientUID) else {
             throw PrivilegedCoreError.untrustedClientUID(clientUID)
         }
@@ -264,9 +269,80 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         guard !home.isEmpty, home != "/" else {
             throw PrivilegedCoreError.untrustedClientUID(clientUID)
         }
-        return URL(fileURLWithPath: home, isDirectory: true)
-            .appendingPathComponent(ProxyHelperConstants.userConfigDirectoryRelativePath, isDirectory: true)
-            .appendingPathComponent(fileName, isDirectory: false)
+
+        // The home root comes from the passwd DB, so following it is acceptable;
+        // its ownership is still checked.
+        var dirFD = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard dirFD >= 0 else {
+            throw PrivilegedCoreError.pathNotTrusted(component: home, reason: "open failed (errno \(errno))")
+        }
+        defer { if dirFD >= 0 { close(dirFD) } }
+        try Self.verifyDirectoryFD(dirFD, component: home, expectedUID: clientUID)
+
+        for component in Self.userConfigPathComponents {
+            let next = openat(dirFD, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard next >= 0 else {
+                // ELOOP here means the component is a symlink, which is exactly
+                // the attack we are refusing.
+                throw PrivilegedCoreError.pathNotTrusted(
+                    component: component,
+                    reason: errno == ELOOP ? "is a symbolic link" : "openat failed (errno \(errno))")
+            }
+            close(dirFD)
+            dirFD = next
+            try Self.verifyDirectoryFD(dirFD, component: component, expectedUID: clientUID)
+        }
+
+        let fileFD = openat(dirFD, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fileFD >= 0 else {
+            throw PrivilegedCoreError.configUnreadable(
+                path: fileName,
+                reason: errno == ELOOP ? "is a symbolic link" : "openat failed (errno \(errno))")
+        }
+        defer { close(fileFD) }
+
+        var st = stat()
+        guard fstat(fileFD, &st) == 0 else {
+            throw PrivilegedCoreError.configUnreadable(path: fileName, reason: "fstat failed (errno \(errno))")
+        }
+        guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            throw PrivilegedCoreError.configUnreadable(path: fileName, reason: "not a regular file")
+        }
+        // A hardlink to someone else's file would survive the symlink checks, so
+        // require the config to actually belong to the calling user.
+        guard st.st_uid == clientUID else {
+            throw PrivilegedCoreError.configOwnerMismatch(expected: clientUID, actual: st.st_uid)
+        }
+        guard st.st_size > 0 else {
+            throw PrivilegedCoreError.configUnreadable(path: fileName, reason: "empty file")
+        }
+        guard st.st_size <= off_t(ProxyHelperConstants.maximumConfigBytes) else {
+            throw PrivilegedCoreError.configTooLarge(limit: ProxyHelperConstants.maximumConfigBytes)
+        }
+
+        let handle = FileHandle(fileDescriptor: fileFD, closeOnDealloc: false)
+        guard let data = try handle.readToEnd(), !data.isEmpty else {
+            throw PrivilegedCoreError.configUnreadable(path: fileName, reason: "read returned no bytes")
+        }
+        return data
+    }
+
+    private static func verifyDirectoryFD(_ fd: Int32, component: String, expectedUID: uid_t) throws {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            throw PrivilegedCoreError.pathNotTrusted(component: component, reason: "fstat failed (errno \(errno))")
+        }
+        guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+            throw PrivilegedCoreError.pathNotTrusted(component: component, reason: "not a directory")
+        }
+        guard st.st_uid == expectedUID || st.st_uid == 0 else {
+            throw PrivilegedCoreError.pathNotTrusted(
+                component: component,
+                reason: "owned by uid \(st.st_uid), expected \(expectedUID) or root")
+        }
+        guard (st.st_mode & mode_t(S_IWOTH)) == 0 else {
+            throw PrivilegedCoreError.pathNotTrusted(component: component, reason: "world writable")
+        }
     }
 
     // MARK: - Trust checks
@@ -326,7 +402,10 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         try self.validateDirectory(ProxyHelperConstants.privilegedRootPath)
         for (path, mode) in [
             (ProxyHelperConstants.privilegedRunDirectoryPath, mode_t(0o700)),
-            (ProxyHelperConstants.privilegedLogDirectoryPath, mode_t(0o755)),
+            // 0750 root:staff -- the console user is in `staff`, so the app can
+            // still tail the log, but other local accounts cannot read the DNS
+            // queries and connection destinations a root core writes there.
+            (ProxyHelperConstants.privilegedLogDirectoryPath, mode_t(0o750)),
         ] {
             if lstatPath(path) == nil {
                 guard mkdir(path, mode) == 0 else {
@@ -334,7 +413,8 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
                         path: path,
                         reason: "mkdir failed (errno \(errno))")
                 }
-                _ = chown(path, 0, 0)
+                let gid: gid_t = mode == mode_t(0o750) ? Self.staffGID : 0
+                _ = chown(path, 0, gid)
                 _ = chmod(path, mode)
             }
             try self.validateDirectory(path)
@@ -342,35 +422,6 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
     }
 
     // MARK: - Config staging
-
-    private static func readConfig(at url: URL) throws -> Data {
-        let path = url.path
-        let fd = open(path, O_RDONLY | O_NOFOLLOW)
-        guard fd >= 0 else {
-            throw PrivilegedCoreError.configUnreadable(path: path, reason: "open failed (errno \(errno))")
-        }
-        defer { close(fd) }
-
-        var st = stat()
-        guard fstat(fd, &st) == 0 else {
-            throw PrivilegedCoreError.configUnreadable(path: path, reason: "fstat failed (errno \(errno))")
-        }
-        guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
-            throw PrivilegedCoreError.configUnreadable(path: path, reason: "not a regular file")
-        }
-        guard st.st_size > 0 else {
-            throw PrivilegedCoreError.configUnreadable(path: path, reason: "empty file")
-        }
-        guard st.st_size <= off_t(ProxyHelperConstants.maximumConfigBytes) else {
-            throw PrivilegedCoreError.configTooLarge(limit: ProxyHelperConstants.maximumConfigBytes)
-        }
-
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        guard let data = try handle.readToEnd(), !data.isEmpty else {
-            throw PrivilegedCoreError.configUnreadable(path: path, reason: "read returned no bytes")
-        }
-        return data
-    }
 
     private static func stageRuntimeConfig(_ data: Data) throws {
         let path = ProxyHelperConstants.privilegedRuntimeConfigPath
@@ -396,7 +447,7 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
 
     private static func openCoreLogHandle() throws -> FileHandle {
         let path = ProxyHelperConstants.privilegedCoreLogPath
-        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o644)
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o640)
         guard fd >= 0 else {
             throw PrivilegedCoreError.stagingFailed(reason: "open core log failed (errno \(errno))")
         }
@@ -404,16 +455,18 @@ final class PrivilegedCoreRunner: @unchecked Sendable {
         if fstat(fd, &st) == 0, st.st_size > off_t(ProxyHelperConstants.maximumCoreLogBytes) {
             _ = ftruncate(fd, 0)
         }
-        _ = fchown(fd, 0, 0)
-        _ = fchmod(fd, 0o644)
+        _ = fchown(fd, 0, Self.staffGID)
+        _ = fchmod(fd, 0o640)
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     private static func appendHelperNote(_ line: String) {
         let path = ProxyHelperConstants.privilegedCoreLogPath
-        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o644)
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o640)
         guard fd >= 0 else { return }
         defer { close(fd) }
+        _ = fchown(fd, 0, Self.staffGID)
+        _ = fchmod(fd, 0o640)
         let stamp = ISO8601DateFormatter().string(from: Date())
         if let data = "\(stamp) \(line)\n".data(using: .utf8) {
             _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }

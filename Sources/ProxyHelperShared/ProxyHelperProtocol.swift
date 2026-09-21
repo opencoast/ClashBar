@@ -78,12 +78,15 @@ public protocol ProxyHelperProtocol {
     ///     directory. Anything else is rejected.
     ///   - controllerHost: Must be a loopback literal (`127.0.0.1` or `::1`).
     ///   - controllerPort: 1...65535.
-    ///   - completion: `(ok, pid, message)`. `pid` is 0 on failure.
+    ///   - completion: `(ok, pid, secret, message)`. `pid` is 0 on failure.
+    ///     `secret` is the controller token the helper generated and injected
+    ///     into the staged config; the caller must use it as the bearer token.
+    ///     The user's own `secret` is stripped, so this is the only way in.
     func startCore(
         configFileName: String,
         controllerHost: String,
         controllerPort: Int,
-        completion: @escaping (Bool, Int, String?) -> Void)
+        completion: @escaping (Bool, Int, String?, String?) -> Void)
 
     /// Stops the privileged core. Succeeds when nothing is running.
     func stopCore(completion: @escaping (Bool, String?) -> Void)

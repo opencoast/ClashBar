@@ -29,6 +29,11 @@ final class PrivilegedCoreController: MihomoControlling, MihomoLogObserving, @un
     var onLog: ((String) -> Void)?
     var onTermination: ((Int32) -> Void)?
 
+    /// Set after a successful privileged start. The helper strips the user's own
+    /// `secret` and injects its own, so the app must pick this up or every API
+    /// call to the root core will fail authentication.
+    private(set) var injectedControllerSecret: String?
+
     /// - Parameter validator: used for `mihomo -t`, which needs no privilege and
     ///   is best run as the user against the user's own copy of the config.
     init(
@@ -73,8 +78,12 @@ final class PrivilegedCoreController: MihomoControlling, MihomoLogObserving, @un
         self.logTail.start(fromEnd: true)
 
         do {
-            let pid = try await self.service.startCore(configFileName: fileName, endpoint: endpoint)
-            self.lock.withLock { self.storedStatus = .running(pid: Int32(pid)) }
+            let started = try await self.service.startCore(configFileName: fileName, endpoint: endpoint)
+            let pid = started.pid
+            self.lock.withLock {
+                self.storedStatus = .running(pid: Int32(pid))
+                self.injectedControllerSecret = started.secret
+            }
             self.onLog?(
                 "[mihomo started] privileged pid=\(pid) controller=\(endpoint.displayValue) " +
                     "binary=\(ProxyHelperConstants.privilegedCoreBinaryPath) " +
@@ -229,6 +238,12 @@ final class CoreBackendRouter: MihomoControlling, MihomoLogObserving, @unchecked
     var status: CoreLifecycleStatus { self.current.status }
     var isRunning: Bool { self.current.isRunning }
     var detectedBinaryPath: String? { self.unprivileged.detectedBinaryPath }
+
+    /// Non-nil only while a privileged core is running.
+    var injectedControllerSecret: String? {
+        let backend = self.lock.withLock { self.activeBackend }
+        return backend == .privileged ? self.privileged.injectedControllerSecret : nil
+    }
 
     func validateConfigAsync(configPath: String) async throws {
         try await self.unprivileged.validateConfigAsync(configPath: configPath)

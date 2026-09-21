@@ -54,6 +54,7 @@ extension AppViewModel {
             let launchController = applyExternalControllerFromSelectedConfigFile(configPath: configPath)
             statusText = "Starting"
             _ = try await self.coreRepository.start(configPath: configPath, controller: launchController)
+            self.adoptPrivilegedControllerSecretIfNeeded()
 
             await self.completeCoreBootstrap(
                 configPath: configPath,
@@ -144,6 +145,7 @@ extension AppViewModel {
             // unprivileged child process.
             self.syncPrivilegedBackendSelection(tunEnabled: privilegedBackend ?? self.isTunEnabled)
             _ = try await self.coreRepository.restart(configPath: configPath, controller: launchController)
+            self.adoptPrivilegedControllerSecretIfNeeded()
             await self.completeCoreBootstrap(
                 configPath: configPath,
                 settingsOverlay: settingsOverlay,

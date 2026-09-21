@@ -180,6 +180,36 @@ jobs:
           echo "swift build failed; see the job summary for the copyable error list."
           exit 1
 
+  test:
+    name: swift test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the newest Xcode
+        run: |
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer"
+          swift --version
+      - name: swift test
+        run: |
+          set +e
+          swift test 2>&1 | tee test.log
+          CODE=${PIPESTATUS[0]}
+          {
+            echo "## swift test"
+            echo ""
+            echo '```'
+            grep -E '^Test Suite|^Test Case.*(passed|failed)|error:|XCTAssert' test.log | tail -80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$CODE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-log
+          path: test.log
+          if-no-files-found: warn
+
   package:
     name: make build
     needs: compile

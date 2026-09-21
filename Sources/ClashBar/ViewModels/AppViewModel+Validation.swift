@@ -99,6 +99,11 @@ extension AppViewModel {
     }
 
     private func applyControllerSecretFromConfig(_ rawValue: String?) {
+        // While a privileged core is running, the helper's injected secret is the
+        // only working credential -- it strips the user's own `secret` from the
+        // staged config, so re-reading the config file here would replace a valid
+        // token with a stale or absent one and every API call would 401.
+        guard self.injectedPrivilegedSecret == nil else { return }
         let normalizedSecret = self.normalizedControllerSecret(rawValue)
         let currentSecret = self.normalizedControllerSecret(controllerSecret)
         if normalizedSecret != currentSecret {

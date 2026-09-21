@@ -6,15 +6,12 @@ import ProxyHelperShared
 enum TunPermissionServiceError: LocalizedError {
     case coreBinaryNotFound
     case coreBinaryNotExecutable
-    case permissionMissing
-    case authorizationCancelled
-    case authorizationFailed(String)
-    case permissionVerificationFailed
-    /// A privileged core is installed but its bytes no longer match the core the
-    /// app manages, i.e. the user updated `~/.../clashbar/core/mihomo`.
-    case privilegedCoreStale
-    /// The privileged core exists but fails a trust check (wrong owner, group or
-    /// world writable, symlink, unexpected setuid bit).
+    /// No privileged core installed yet. Carries the command the user must run.
+    case permissionMissing(command: String)
+    /// A privileged core exists but its bytes differ from the managed core.
+    case privilegedCoreStale(command: String)
+    /// Installed but fails a trust check (wrong owner, group/world writable,
+    /// symlink, unexpected setuid bit).
     case privilegedCoreNotTrusted(String)
     case hashingFailed(String)
 
@@ -24,16 +21,10 @@ enum TunPermissionServiceError: LocalizedError {
             "mihomo binary not found."
         case .coreBinaryNotExecutable:
             "mihomo binary is not executable."
-        case .permissionMissing:
-            "No privileged mihomo core is installed for TUN mode."
-        case .authorizationCancelled:
-            "Administrator authorization was cancelled."
-        case let .authorizationFailed(message):
-            "Failed to install the privileged mihomo core: \(message)"
-        case .permissionVerificationFailed:
-            "The privileged mihomo core was not installed successfully."
-        case .privilegedCoreStale:
-            "The installed privileged core is older than the managed core."
+        case let .permissionMissing(command):
+            "TUN mode needs a root-owned copy of the core. Run:\n\(command)"
+        case let .privilegedCoreStale(command):
+            "The privileged core is out of date. Run:\n\(command)"
         case let .privilegedCoreNotTrusted(reason):
             "The installed privileged core is not trustworthy: \(reason)"
         case let .hashingFailed(message):
@@ -42,22 +33,52 @@ enum TunPermissionServiceError: LocalizedError {
     }
 }
 
-/// Installs and validates the *privileged* copy of the mihomo core.
+/// Verifies the *privileged* copy of the mihomo core. **Performs no privileged
+/// operations of its own.**
 ///
-/// The previous implementation made the user-owned core setuid-root in place.
-/// That left a root-executable binary inside a user-writable directory reading a
-/// user-writable config, which any local process running as that user could
-/// invoke with arguments of its own choosing.
+/// History worth keeping, because it is the whole point of this file:
 ///
-/// Instead we copy the core, once per version, into a root-owned directory under
-/// `/Library/Application Support/ClashBar`, and let the privileged helper spawn
-/// it with a fixed argument vector. The admin prompt is the user's consent to
-/// trust *those bytes*; it no longer grants blanket setuid.
+/// 1. Upstream made the user-owned core setuid-root in place. That left a
+///    root-executable binary inside a user-writable directory reading a
+///    user-writable config — any local process running as that user could invoke
+///    it with arguments of its own choosing.
+/// 2. The first attempt at a fix copied the core into a root-owned directory via
+///    one `osascript ... with administrator privileges` prompt. That was **worse**:
+///    `/Library/Application Support` is `root:admin 0775` and the console user is
+///    normally in `admin`, so an attacker could pre-create
+///    `…/ClashBar/core` as a symlink. `chmod` follows symlinks and
+///    `install` writes through them, so one approved prompt yielded a root-owned
+///    `0755` write to an attacker-chosen path. An inline `sh -c` running as root
+///    cannot be made safe against a local attacker who can loop — `test -L`
+///    only narrows the race.
+///
+/// So this type now does **zero** root file operations. Installation is an
+/// explicit, user-run `install(1)` command; the app only reports whether the
+/// result is trustworthy. A proper in-helper installer (an `openat`/`mkdirat`
+/// chain gated on an Authorization Services right) is the follow-up, and it is
+/// the only version that can be both automatic and safe.
 struct TunPermissionService {
-    // Deliberately property-free: `grantPermissions` hands the install work to
-    // `Task.detached`, whose closure is `@Sendable`. A stored `FileManager`
-    // (which is not `Sendable`) would strip this struct's implicit `Sendable`
-    // conformance and break that call site.
+    // MARK: - The command the user runs
+
+    /// Single source of truth for the install step, so the error text, the log
+    /// line and the docs cannot drift apart.
+    static func installCommand(managedBinaryPath: String) -> String {
+        let core = ProxyHelperConstants.privilegedCoreBinaryPath
+        let root = ProxyHelperConstants.privilegedRootPath
+        return """
+        sudo mkdir -p \(shellQuoted(ProxyHelperConstants.privilegedCoreDirectoryPath)) && \\
+        sudo chown -R root:wheel \(shellQuoted(root)) && \\
+        sudo chmod 755 \(shellQuoted(root)) \(shellQuoted(ProxyHelperConstants.privilegedCoreDirectoryPath)) && \\
+        sudo install -o root -g wheel -m 755 \(shellQuoted(managedBinaryPath)) \(shellQuoted(core))
+        """
+    }
+
+    /// Clears a setuid bit left by an older ClashBar. Also user-run: dropping a
+    /// setuid bit needs root, and we no longer take root for file operations.
+    static func legacyCleanupCommand(managedBinaryPath: String) -> String {
+        "sudo chmod u-s \(shellQuoted(managedBinaryPath)) && " +
+            "sudo chown \(getuid()):\(getgid()) \(shellQuoted(managedBinaryPath))"
+    }
 
     // MARK: - Queries
 
@@ -67,19 +88,20 @@ struct TunPermissionService {
 
     func validateCurrentPermissions(binaryPath: String) throws {
         let managedPath = try self.validateBinaryPath(binaryPath)
+        let command = Self.installCommand(managedBinaryPath: managedPath)
 
-        try self.validatePrivilegedCoreTrust()
+        try self.validatePrivilegedCoreTrust(installCommand: command)
 
         let managedDigest = try self.sha256Hex(ofFileAt: managedPath)
         let privilegedDigest = try self.sha256Hex(ofFileAt: ProxyHelperConstants.privilegedCoreBinaryPath)
         guard managedDigest == privilegedDigest else {
-            throw TunPermissionServiceError.privilegedCoreStale
+            throw TunPermissionServiceError.privilegedCoreStale(command: command)
         }
     }
 
-    /// True when a previous ClashBar version left a setuid bit on the
-    /// user-managed core. Surfacing this lets the app offer to clean it up
-    /// instead of silently leaving a local privilege-escalation primitive behind.
+    /// True when an older ClashBar left a setuid bit, or left the managed core
+    /// owned by root. Either state is a local privilege-escalation primitive the
+    /// user should be told about even if they never enable TUN again.
     func legacySetuidPresent(binaryPath: String) -> Bool {
         let path = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { return false }
@@ -88,25 +110,27 @@ struct TunPermissionService {
         return (st.st_mode & mode_t(S_ISUID)) != 0 || st.st_uid == 0
     }
 
-    // MARK: - Mutations
-
+    /// Kept to satisfy `TunPermissionRepository`. It cannot grant anything any
+    /// more; it reports the command to run.
     func grantPermissions(binaryPath: String) async throws {
-        let resolved = try self.validateBinaryPath(binaryPath)
-        try await Task.detached(priority: .userInitiated) {
-            try self.installPrivilegedCoreSynchronously(managedBinaryPath: resolved)
-        }.value
+        let managedPath = try self.validateBinaryPath(binaryPath)
+        do {
+            try self.validateCurrentPermissions(binaryPath: managedPath)
+        } catch {
+            throw error
+        }
     }
 
     // MARK: - Trust checks
 
-    private func validatePrivilegedCoreTrust() throws {
+    private func validatePrivilegedCoreTrust(installCommand: String) throws {
         for directory in [
             ProxyHelperConstants.privilegedRootPath,
             ProxyHelperConstants.privilegedCoreDirectoryPath,
         ] {
             var st = stat()
             guard lstat(directory, &st) == 0 else {
-                throw TunPermissionServiceError.permissionMissing
+                throw TunPermissionServiceError.permissionMissing(command: installCommand)
             }
             guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
                 throw TunPermissionServiceError.privilegedCoreNotTrusted("\(directory) is not a directory")
@@ -114,6 +138,8 @@ struct TunPermissionService {
             guard st.st_uid == 0 else {
                 throw TunPermissionServiceError.privilegedCoreNotTrusted("\(directory) is not owned by root")
             }
+            // This is the check that would have caught the pre-created-symlink
+            // attack: `root:admin 0775` fails it.
             guard (st.st_mode & mode_t(S_IWGRP | S_IWOTH)) == 0 else {
                 throw TunPermissionServiceError.privilegedCoreNotTrusted("\(directory) is group/world writable")
             }
@@ -122,7 +148,7 @@ struct TunPermissionService {
         let path = ProxyHelperConstants.privilegedCoreBinaryPath
         var st = stat()
         guard lstat(path, &st) == 0 else {
-            throw TunPermissionServiceError.permissionMissing
+            throw TunPermissionServiceError.permissionMissing(command: installCommand)
         }
         guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
             throw TunPermissionServiceError.privilegedCoreNotTrusted("not a regular file")
@@ -153,78 +179,6 @@ struct TunPermissionService {
         return resolved
     }
 
-    // MARK: - Install
-
-    private func installPrivilegedCoreSynchronously(managedBinaryPath: String) throws {
-        let uid = getuid()
-        let gid = getgid()
-
-        let root = ProxyHelperConstants.privilegedRootPath
-        let coreDir = ProxyHelperConstants.privilegedCoreDirectoryPath
-        let runDir = ProxyHelperConstants.privilegedRunDirectoryPath
-        let logDir = ProxyHelperConstants.privilegedLogDirectoryPath
-        let corePath = ProxyHelperConstants.privilegedCoreBinaryPath
-        let runtimeConfig = ProxyHelperConstants.privilegedRuntimeConfigPath
-
-        // One prompt, one inline command. Deliberately not a temp script file:
-        // a script read by root out of a user-writable path is swappable between
-        // write and exec.
-        let steps = [
-            "/bin/mkdir -p \(q(coreDir)) \(q(runDir)) \(q(logDir))",
-            "/usr/sbin/chown -R root:wheel \(q(root))",
-            "/bin/chmod 755 \(q(root)) \(q(coreDir)) \(q(logDir))",
-            "/bin/chmod 700 \(q(runDir))",
-            "/usr/bin/install -o root -g wheel -m 755 \(q(managedBinaryPath)) \(q(corePath))",
-            // Undo any setuid left by ClashBar <= 0.x and hand the managed copy
-            // back to the user so the app can keep updating it normally.
-            "/bin/chmod u-s \(q(managedBinaryPath))",
-            "/usr/sbin/chown \(uid):\(gid) \(q(managedBinaryPath))",
-            // A staged config from a previous core version must not be reused.
-            "/bin/rm -f \(q(runtimeConfig))",
-        ]
-
-        try self.runAppleScriptSynchronously(
-            "do shell script \"\(self.appleScriptEscaped(steps.joined(separator: " && ")))\" " +
-                "with administrator privileges")
-
-        do {
-            try self.validateCurrentPermissions(binaryPath: managedBinaryPath)
-        } catch {
-            throw TunPermissionServiceError.permissionVerificationFailed
-        }
-    }
-
-    private func runAppleScriptSynchronously(_ script: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            throw TunPermissionServiceError.authorizationFailed(error.localizedDescription)
-        }
-
-        guard process.terminationStatus == 0 else {
-            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let message = [stderr, stdout].first(where: { !$0.isEmpty }) ?? "Unknown authorization error."
-            let lowered = message.lowercased()
-            if lowered.contains("user canceled") || lowered.contains("user cancelled") || lowered.contains("(-128)") {
-                throw TunPermissionServiceError.authorizationCancelled
-            }
-            throw TunPermissionServiceError.authorizationFailed(message)
-        }
-    }
-
     // MARK: - Hashing
 
     private func sha256Hex(ofFileAt path: String) throws -> String {
@@ -234,9 +188,8 @@ struct TunPermissionService {
         defer { try? handle.close() }
 
         var hasher = SHA256()
-        let chunkSize = 1 << 20
         do {
-            while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
                 hasher.update(data: chunk)
             }
         } catch {
@@ -245,16 +198,8 @@ struct TunPermissionService {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    // MARK: - Quoting
-
-    private func q(_ value: String) -> String {
+    private static func shellQuoted(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
-    }
-
-    private func appleScriptEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }
 
@@ -280,5 +225,13 @@ final class DefaultTunPermissionRepository: TunPermissionRepository {
 
     func legacySetuidPresent(binaryPath: String) -> Bool {
         self.service.legacySetuidPresent(binaryPath: binaryPath)
+    }
+
+    func installCommand(binaryPath: String) -> String {
+        TunPermissionService.installCommand(managedBinaryPath: binaryPath)
+    }
+
+    func legacyCleanupCommand(binaryPath: String) -> String {
+        TunPermissionService.legacyCleanupCommand(managedBinaryPath: binaryPath)
     }
 }

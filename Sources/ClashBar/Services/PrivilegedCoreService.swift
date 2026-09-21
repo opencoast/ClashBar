@@ -22,58 +22,9 @@ enum PrivilegedCoreServiceError: LocalizedError {
     }
 }
 
-/// Endpoint the privileged core should expose its controller on. Always loopback.
-struct PrivilegedControllerEndpoint {
-    let host: String
-    let port: Int
-
-    /// Parses the app's `external-controller` string. A non-loopback bind address
-    /// is rewritten to `127.0.0.1` rather than rejected: the helper would refuse
-    /// it anyway, and silently widening the controller of a *root* process to the
-    /// LAN is exactly what we are trying to prevent.
-    static func parse(_ raw: String) throws -> PrivilegedControllerEndpoint {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw PrivilegedCoreServiceError.invalidController(raw) }
-
-        var hostPart: String
-        var portPart: String
-
-        if trimmed.hasPrefix("[") {
-            guard let close = trimmed.firstIndex(of: "]") else {
-                throw PrivilegedCoreServiceError.invalidController(raw)
-            }
-            hostPart = String(trimmed[trimmed.index(after: trimmed.startIndex)..<close])
-            let rest = trimmed[trimmed.index(after: close)...]
-            guard rest.hasPrefix(":") else { throw PrivilegedCoreServiceError.invalidController(raw) }
-            portPart = String(rest.dropFirst())
-        } else {
-            guard let separator = trimmed.lastIndex(of: ":") else {
-                throw PrivilegedCoreServiceError.invalidController(raw)
-            }
-            hostPart = String(trimmed[trimmed.startIndex..<separator])
-            portPart = String(trimmed[trimmed.index(after: separator)...])
-        }
-
-        guard let port = Int(portPart), (1...65535).contains(port) else {
-            throw PrivilegedCoreServiceError.invalidController(raw)
-        }
-
-        let normalizedHost: String
-        switch hostPart {
-        case "::1":
-            normalizedHost = "::1"
-        case "127.0.0.1", "localhost", "":
-            normalizedHost = "127.0.0.1"
-        default:
-            normalizedHost = "127.0.0.1"
-        }
-        return PrivilegedControllerEndpoint(host: normalizedHost, port: port)
-    }
-
-    var displayValue: String {
-        self.host == "::1" ? "[::1]:\(self.port)" : "\(self.host):\(self.port)"
-    }
-}
+// `PrivilegedControllerEndpoint` now lives in ProxyHelperShared so the helper
+// and the app validate the endpoint with the same code, and so it can be unit
+// tested without a signed helper.
 
 /// Thin XPC client for the helper's privileged core lifecycle methods.
 final class PrivilegedCoreService: @unchecked Sendable {
@@ -89,14 +40,21 @@ final class PrivilegedCoreService: @unchecked Sendable {
         let lastExitCode: Int
     }
 
-    func startCore(configFileName: String, endpoint: PrivilegedControllerEndpoint) async throws -> Int {
+    struct Started: Sendable {
+        let pid: Int
+        /// The controller token the helper injected. Without it every API call
+        /// to the root core returns 401, so this must reach the API client.
+        let secret: String?
+    }
+
+    func startCore(configFileName: String, endpoint: PrivilegedControllerEndpoint) async throws -> Started {
         try await self.invoke { helper, done in
             helper.startCore(
                 configFileName: configFileName,
                 controllerHost: endpoint.host,
-                controllerPort: endpoint.port) { ok, pid, message in
+                controllerPort: endpoint.port) { ok, pid, secret, message in
                     if ok {
-                        done(.success(pid))
+                        done(.success(Started(pid: pid, secret: secret)))
                     } else {
                         done(.failure(PrivilegedCoreServiceError.operationFailed(
                             message ?? "startCore failed without a message.")))

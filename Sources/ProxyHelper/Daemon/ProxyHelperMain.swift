@@ -518,17 +518,17 @@ private final class ProxyHelperService: NSObject, ProxyHelperProtocol {
         configFileName: String,
         controllerHost: String,
         controllerPort: Int,
-        completion: @escaping (Bool, Int, String?) -> Void)
+        completion: @escaping (Bool, Int, String?, String?) -> Void)
     {
         do {
-            let pid = try self.coreRunner.start(
+            let started = try self.coreRunner.start(
                 configFileName: configFileName,
                 controllerHost: controllerHost,
                 controllerPort: controllerPort,
                 clientUID: self.clientUID)
-            completion(true, pid, nil)
+            completion(true, started.pid, started.secret, nil)
         } catch {
-            completion(false, 0, error.localizedDescription)
+            completion(false, 0, nil, error.localizedDescription)
         }
     }
 
